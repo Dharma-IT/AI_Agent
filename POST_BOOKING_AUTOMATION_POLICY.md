@@ -1,0 +1,39 @@
+# Post-Booking Automation Policy
+
+## Purpose
+
+After an appointment is confirmed, the automated agent must not respond until the meeting has ended. Respond assignment is retried independently when necessary.
+
+## HubSpot confirmation workflow
+
+- Every successful HubSpot calendar booking enrolls the booked contact in workflow `1660572815`.
+- Override the workflow with `HUBSPOT_POST_BOOKING_WORKFLOW_ID` when deploying to another portal.
+- The contact email is derived from the confirmed phone number (for example, `13478665207@dummy.com`), while the HubSpot `phone` property contains the same real phone number used by the workflow message.
+- The HubSpot private app must have the `automation` scope. Workflow enrollment is attempted only after HubSpot returns a confirmed calendar event.
+
+## Lock rule
+
+- The lock starts immediately after HubSpot booking confirmation. Respond assignment is attempted separately; if that request fails, the active lock suppresses automation and retries restoration on later conversation events or inbound messages. A missing specialist mapping prevents ownership restoration but does not disable reply suppression.
+- `locked_until` is the confirmed meeting end in UTC plus the configured grace period.
+- The default grace period is 60 minutes and can be changed with `RESPOND_POST_BOOKING_GRACE_MINUTES`.
+- While locked, inbound messages are acknowledged by the webhook but no automated reply, classification, RAG lookup, transfer, or booking flow is run.
+- The assigned specialist remains responsible for the conversation during the lock.
+- If a Respond workflow reopens, unassigns, or routes the conversation to someone else during the lock, the webhook automatically restores the booked specialist without sending a customer message.
+
+## Expiration and restart
+
+- Expiration is evaluated when the next inbound customer message arrives; the bot does not send a proactive message.
+- On the first inbound message after `locked_until`, the system expires the lock, unassigns the prior specialist, clears the prior in-memory booking conversation, and handles that inbound message from the beginning of the flow.
+- Language is detected from the new inbound message. The initial greeting and state question are sent again.
+
+## Failure and lifecycle rules
+
+- A failed booking must not create a lock. A failed Respond assignment must leave the confirmed booking lock active so automation stays suppressed and assignment restoration can be retried.
+- Meeting timestamps are stored and compared as UTC instants; customer timezone affects display only.
+- Rescheduling must replace the active lock with the newly confirmed meeting timestamps.
+- Cancellation must expire the active lock when cancellation integration is available.
+- This policy is independent of the Customer Service transfer/handoff timeout.
+
+## Persistence
+
+Locks are stored in `respond_post_booking_locks`. The database migration must be applied in every deployed environment. The server also keeps the current lock in memory as a short-term runtime fallback.

@@ -1,0 +1,551 @@
+const DEFAULT_TRANSFER_IDLE_HOURS = 24
+const IRATE_PATTERNS = [
+  /\b(angry|upset|mad|furious|frustrated|annoyed|unhappy|disappointed|complaint|complain|ridiculous|terrible|horrible|awful|unacceptable|scam|fraud|lawsuit|lawyer|attorney|cancel|refund|chargeback|report you|bad service|worst)\b/,
+  /\b(enojad[oa]|molest[oa]|furios[oa]|frustrad[oa]|decepcionad[oa]|queja|reclamo|reclamar|ridiculo|terrible|horrible|pesimo|inaceptable|(?:e|w)staf[a-z]*|engan(?:o|aron|ado|ada)|rob(?:o|aron|ado|ada)|ladron(?:es|a|as)?|fraude|demanda|abogado|abogada|cancelar|refund|reembolso|devolucion|contracargo|reportar|mal servicio|peor)\b/,
+  /\b(brav[oa]|irritad[oa]|furios[oa]|frustrad[oa]|chatead[oa]|decepcionad[oa]|reclamacao|reclamar|queixa|ridiculo|terrivel|horrivel|pessimo|inaceitavel|golpe|fraude|processo|advogado|advogada|cancelar|reembolso|estorno|denunciar|mau atendimento|pior)\b/,
+  /\b(quiero|necesito|dame|devuelvan|devuelveme|exijo)\b[\s\S]{0,50}\b(refund|reembolso|devolucion|dinero|money)\b/,
+  /\b(estafador(?:es|a|as)?|estafa|fraude|scam)\b[\s\S]{0,80}\b(refund|reembolso|devolucion|dinero|money)\b/,
+  /\b(pague|gaste|me cobraron|cobraron)\b[\s\S]{0,120}\b(no (?:vi|tuve|obtuve) resultados|no baje (?:de )?peso|sin resultados)\b/,
+  /\bme dieron\b[\s\S]{0,60}\bmas b12\b/,
+]
+
+export function getRespondAutomationDecision({ contactProfile, session = {}, event = {}, now = Date.now() } = {}) {
+  const sessionHandoffActive = Boolean(session.transferHandoffAt || session.handoffAt)
+  const sessionHandoffAt = getSessionHandoffAt(session)
+  const sessionClosedAfterHandoff = Boolean(session.transferClosedAt)
+  const assignee = getConversationAssignee(contactProfile)
+  const assigned = isConversationAssigned(contactProfile)
+  const closed = isConversationClosed(contactProfile)
+  const conversationOpenedAt = getConversationOpenedAt(contactProfile)
+  const idleResumeEnabled = isTransferIdleResumeEnabled()
+  const lastHumanActivityAt = getLastHumanActivityAt(contactProfile, session)
+  const idleExpired = isTransferIdleExpired({ lastHumanActivityAt, now })
+
+  if (!sessionHandoffActive) {
+    return {
+      action: 'allow',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      reason: assigned
+        ? 'Conversation is assigned, but there is no active bot transfer marker, so automation can continue.'
+        : 'Conversation is not assigned to a human.',
+    }
+  }
+
+  if (assigned && closed) {
+    return {
+      action: 'allow_closed_restart',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      reason: 'Conversation is assigned but closed, so automation can restart on the new inbound message.',
+    }
+  }
+
+  if (
+    assigned &&
+    sessionHandoffActive &&
+    !closed &&
+    (sessionClosedAfterHandoff || didConversationOpenAfterHandoff({
+      conversationOpenedAt,
+      sessionHandoffAt,
+    }))
+  ) {
+    return {
+      action: 'allow_reopened_restart',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      conversationOpenedAt,
+      lastHumanActivityAt,
+      reason: sessionClosedAfterHandoff
+        ? 'Conversation was previously closed after transfer and is now open again, so automation can restart.'
+        : 'Conversation was reopened by the contact after a previous transfer handoff, so automation can restart.',
+    }
+  }
+
+  if (!assigned && sessionHandoffActive) {
+    return {
+      action: 'allow_unassigned_restart',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      conversationOpenedAt,
+      lastHumanActivityAt,
+      reason: 'Conversation has a previous transfer marker but is currently unassigned, so automation can restart.',
+    }
+  }
+
+  if (assigned && idleResumeEnabled && idleExpired) {
+    return {
+      action: 'allow_idle_timeout',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      idleHours: getTransferIdleHours(),
+      lastHumanActivityAt,
+      reason: 'Assigned/open handoff exceeded the configured idle window.',
+    }
+  }
+
+  if (assigned) {
+    return {
+      action: 'skip_human_owned',
+      assignee,
+      closed,
+      contactId: event.contactId,
+      idleHours: getTransferIdleHours(),
+      lastHumanActivityAt,
+      reason: closed === false
+        ? 'Conversation is assigned and open, so a human owns it.'
+        : 'Conversation is assigned and status is not closed, so a human owns it.',
+    }
+  }
+
+  return {
+    action: 'allow',
+    assignee,
+    closed,
+    contactId: event.contactId,
+    reason: 'Conversation is not assigned to a human.',
+  }
+}
+
+export function isConversationAssigned(profile = {}) {
+  return Boolean(getConversationAssignee(profile))
+}
+
+export function isConversationClosed(profile = {}) {
+  const status = getConversationStatus(profile)
+
+  if (!status) {
+    return false
+  }
+
+  return /\b(close|closed|done|resolved|complete|completed)\b/i.test(status)
+}
+
+export function getConversationAssignee(profile = {}) {
+  const conversation = getConversation(profile)
+  const candidates = [
+    conversation.assignee,
+    conversation.assignedTo,
+    conversation.assigned_to,
+    conversation.assigneeId,
+    conversation.assignee_id,
+    conversation.assigneeEmail,
+    conversation.assignee_email,
+    conversation.user,
+    conversation.userId,
+    conversation.user_id,
+    profile.conversationAssignee,
+    profile.assignee,
+  ]
+
+  for (const candidate of candidates) {
+    const value = normalizeAssignee(candidate)
+
+    if (value) {
+      return value
+    }
+  }
+
+  return ''
+}
+
+export function getLastHumanActivityAt(profile = {}, session = {}) {
+  const conversation = getConversation(profile)
+  const candidates = [
+    conversation.lastHumanActivityAt,
+    conversation.last_human_activity_at,
+    conversation.lastAssigneeActivityAt,
+    conversation.last_assignee_activity_at,
+    conversation.lastMessageAt,
+    conversation.last_message_at,
+    conversation.updatedAt,
+    conversation.updated_at,
+    conversation.assignedAt,
+    conversation.assigned_at,
+    profile.lastHumanActivityAt,
+    session.transferHandoffAt,
+    session.handoffAt,
+  ]
+
+  for (const candidate of candidates) {
+    const timestamp = normalizeTimestamp(candidate)
+
+    if (timestamp) {
+      return timestamp
+    }
+  }
+
+  return null
+}
+
+export function getConversationOpenedAt(profile = {}) {
+  const conversation = getConversation(profile)
+  const candidates = [
+    conversation.openedAt,
+    conversation.opened_at,
+    conversation.reopenedAt,
+    conversation.reopened_at,
+    conversation.createdAt,
+    conversation.created_at,
+    profile.conversationOpenedAt,
+  ]
+
+  for (const candidate of candidates) {
+    const timestamp = normalizeTimestamp(candidate)
+
+    if (timestamp) {
+      return timestamp
+    }
+  }
+
+  return null
+}
+
+function getSessionHandoffAt(session = {}) {
+  return normalizeTimestamp(session.transferHandoffAt || session.handoffAt)
+}
+
+function didConversationOpenAfterHandoff({ conversationOpenedAt, sessionHandoffAt } = {}) {
+  if (!conversationOpenedAt || !sessionHandoffAt) {
+    return false
+  }
+
+  return conversationOpenedAt > sessionHandoffAt + 1000
+}
+
+export function isTransferIdleExpired({ lastHumanActivityAt, now = Date.now() } = {}) {
+  if (!lastHumanActivityAt) {
+    return false
+  }
+
+  return now - lastHumanActivityAt >= getTransferIdleHours() * 60 * 60 * 1000
+}
+
+export function getTransferIdleHours() {
+  const value = Number(process.env.RESPOND_TRANSFER_IDLE_HOURS)
+
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_TRANSFER_IDLE_HOURS
+}
+
+export function isTransferIdleResumeEnabled() {
+  const value = String(process.env.RESPOND_TRANSFER_IDLE_RESUME ?? 'true').trim().toLowerCase()
+
+  return !['0', 'false', 'no', 'off', 'disabled'].includes(value)
+}
+
+export function detectRespondTransferTrigger(text = '') {
+  const normalized = normalizeTriggerText(text)
+
+  if (!normalized) {
+    return null
+  }
+
+  // Asking whether the consultation or medical review involves a doctor is a
+  // normal sales/booking question, not a request for a Customer Service handoff.
+  if (isDoctorOrProviderQuestion(normalized)) {
+    return null
+  }
+
+  if (isGeneralProductOrMedicationClarification(normalized)) {
+    return null
+  }
+
+  const hasTransferAction =
+    /\b(speak|talk|chat|connect|transfer|escalate|forward|switch|pass|put|hablar|conectar|transferir|pasar|comunicar|derivar|escalar|falar|encaminhar)\b/.test(
+      normalized,
+    )
+  const hasHumanTransferTarget =
+    /\b(human|person|representative|agent|manager|supervisor|customer service|customer care|support|specialist|persona|humano|humana|representante|agente|gerente|supervisor|servicio al cliente|atencion al cliente|soporte|especialista|pessoa|atendimento)\b/.test(
+      normalized,
+    )
+  const requestedTransfer =
+    (hasTransferAction && hasHumanTransferTarget) ||
+    /\b(human|agent|manager|customer service|representative|humano|humana|agente|gerente|servicio al cliente|representante)\s+(please|por favor|ahora)?\b/.test(normalized)
+
+  if (requestedTransfer) {
+    return {
+      type: 'transfer_request',
+      reason: 'Customer requested a human transfer or escalation.',
+    }
+  }
+
+  if (IRATE_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return {
+      type: 'irate_customer',
+      reason: 'Customer message indicates frustration, complaint, refund/cancel pressure, or escalation risk.',
+    }
+  }
+
+  return null
+}
+
+export function isRespondImageMessage(message = {}) {
+  const typeCandidates = [
+    message.type, message.messageType, message.message_type, message.contentType,
+    message.content_type, message.message?.type, message.attachment?.type,
+    message.attachments?.[0]?.type, message.image?.type,
+  ]
+  const mimeCandidates = [
+    message.mimeType, message.mime_type, message.attachment?.mimeType,
+    message.attachment?.mime_type, message.attachments?.[0]?.mimeType,
+    message.attachments?.[0]?.mime_type, message.image?.mimeType, message.image?.mime_type,
+  ]
+
+  return (
+    typeCandidates.some((value) => /^(image|photo|picture)$/i.test(String(value || '').trim())) ||
+    mimeCandidates.some((value) => /^image\//i.test(String(value || '').trim())) ||
+    Boolean(message.image && typeof message.image === 'object')
+  )
+}
+
+export function isRespondUnsupportedMessage(message = {}, extractedText = '') {
+  const typeCandidates = [
+    message.type, message.messageType, message.message_type, message.contentType,
+    message.content_type, message.message?.type, message.attachment?.type,
+    message.attachments?.[0]?.type,
+  ]
+  const textCandidates = [
+    extractedText, message.text, message.body, message.content,
+    message.message?.text, message.message?.body,
+  ]
+
+  return (
+    typeCandidates.some((value) => /^(unsupported|unknown|unsupported_message|document|file|video|sticker|location|contact)$/i.test(String(value || '').trim())) ||
+    textCandidates.some((value) => /^(unsupported message|message not supported|unsupported content)$/i.test(String(value || '').trim()))
+  )
+}
+
+export function isDoctorOrProviderQuestion(text = '') {
+  const normalized = normalizeTriggerText(text)
+
+  return /\b(doctor|doctors|doctora|doctoras|medico|medicos|medica|medicas|provider|providers|proveedor|proveedores|provedor|provedores|doutor|doutora)\b/.test(
+    normalized,
+  )
+}
+
+export function isGeneralProductOrMedicationClarification(text = '') {
+  const normalized = normalizeTriggerText(text)
+  const hasProductTopic =
+    /\b(medication|medications|medicine|treatment|treatments|product|products|injection|injections|medicamento|medicamentos|medicina|tratamiento|tratamientos|producto|productos|inyeccion|inyecciones|ofrecen|ofrece|oferecen|oferecem|oferezen|medicamento|tratamento|produto|injecao)\b/.test(
+      normalized,
+    )
+  const asksGenerally =
+    /\b(what|which|want to know|may i know|can i know|know more|more about|tell me|tell me about|your medications?|your treatments?|offer|offers|do you offer|quiero saber|wuiero saber|saber mas|mas sobre|cual|que ofrecen|que ofrece|qhw oferezen|no quiero saber de (una )?persona|no wuiero saber de (una )?persona|quero saber|saber mais|mais sobre|qual|o que oferecem)\b/.test(
+      normalized,
+    )
+
+  return hasProductTopic && asksGenerally
+}
+
+export function buildRespondTransferMessage({ customerLanguage = 'English', trigger = null } = {}) {
+  const updatedMessage = buildRespondTransferMessageForTrigger({ customerLanguage, trigger })
+
+  if (updatedMessage) {
+    return updatedMessage
+  }
+
+  const language = String(customerLanguage || '').toLowerCase()
+
+  if (language.includes('spanish') || /\bes\b/.test(language)) {
+    return [
+      '💛 Siento mucho que estés pasando por esta situación. Gracias por decírnoslo con claridad.',
+      '',
+      'Voy a transferirte ahora con nuestro equipo de Customer Service para que un especialista experto en este tipo de situación pueda revisar tu caso y ayudarte con más detalle. 🙏',
+    ].join('\n')
+  }
+
+  if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+    return [
+      '💛 Sinto muito que você esteja passando por essa situação. Obrigado por nos explicar.',
+      '',
+      'Vou transferir você agora para nossa equipe de Customer Service, para que um especialista experiente nesse tipo de situação possa revisar seu caso e ajudar com mais detalhes. 🙏',
+    ].join('\n')
+  }
+
+  const intro =
+    trigger?.type === 'transfer_request'
+      ? 'Of course. I can connect you with our team now.'
+      : 'I am really sorry you are dealing with this. Thank you for telling us clearly.'
+
+  return [
+    `💛 ${intro}`,
+    '',
+    'I am transferring you now to our Customer Service team so a specialist who is experienced with this kind of situation can review your case and help you in more detail. 🙏',
+  ].join('\n')
+}
+
+function buildRespondTransferMessageForTrigger({ customerLanguage = 'English', trigger = null } = {}) {
+  const language = String(customerLanguage || '').toLowerCase()
+  const isRequestedTransfer = trigger?.type === 'transfer_request'
+  const isStateLocationClarification = trigger?.type === 'state_location_clarification'
+  const isUnsupportedVoiceMessage = trigger?.type === 'unsupported_voice_message'
+  const isUnsupportedImageMessage = trigger?.type === 'unsupported_image_message'
+  const isUnsupportedMessage = trigger?.type === 'unsupported_message'
+  const isUnrecognizedMessage = trigger?.type === 'unrecognized_message'
+
+  if (isUnsupportedMessage || isUnrecognizedMessage) {
+    if (language.includes('spanish') || /\bes\b/.test(language)) {
+      return isUnrecognizedMessage
+        ? 'No pude entender tu mensaje con suficiente claridad. Voy a conectarte con nuestro equipo de Front Desk para que puedan ayudarte personalmente. 🙏'
+        : 'Recibimos un mensaje que nuestro asistente automatico no puede procesar. Voy a conectarte con nuestro equipo de Front Desk para que puedan ayudarte. 🙏'
+    }
+    if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+      return isUnrecognizedMessage
+        ? 'Nao consegui entender sua mensagem com clareza suficiente. Vou conectar voce a nossa equipe de Front Desk para que possam ajudar pessoalmente. 🙏'
+        : 'Recebemos uma mensagem que nosso assistente automatico nao consegue processar. Vou conectar voce a nossa equipe de Front Desk para que possam ajudar. 🙏'
+    }
+    return isUnrecognizedMessage
+      ? 'I could not understand your message confidently. I am connecting you with our Front Desk team for personal assistance. 🙏'
+      : 'We received a message our automated assistant cannot process. I am connecting you with our Front Desk team for help. 🙏'
+  }
+
+  if (isUnsupportedImageMessage) {
+    if (language.includes('spanish') || /\bes\b/.test(language)) {
+      return 'Recibimos tu imagen. Nuestro asistente automático todavía no puede revisarla, así que voy a conectarte con nuestro equipo de Front Desk para que puedan ayudarte. 🙏'
+    }
+    if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+      return 'Recebemos sua imagem. Nosso assistente automático ainda não consegue analisá-la, então vou conectar você à nossa equipe de Front Desk para que possam ajudar. 🙏'
+    }
+    return 'We received your image. Our automated assistant cannot review it yet, so I’m connecting you with our Front Desk team for help. 🙏'
+  }
+
+  if (isUnsupportedVoiceMessage) {
+    if (language.includes('spanish') || /\bes\b/.test(language)) {
+      return 'Recibimos tu mensaje de voz. Voy a transferirte ahora con nuestro equipo de Customer Service para que puedan ayudarte. 🙏'
+    }
+
+    if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+      return 'Recebemos sua mensagem de voz. Vou transferir você agora para nossa equipe de Customer Service para que possam ajudar. 🙏'
+    }
+
+    return 'We received your voice message. I’m transferring you to our Customer Service team now so they can assist you. 🙏'
+  }
+
+  if (isStateLocationClarification) {
+    if (language.includes('spanish') || /\bes\b/.test(language)) {
+      return '💛 Para ayudarte mejor, voy a transferirte con nuestro equipo de Front Desk. Ellos confirmarán tu ubicación contigo y continuarán ayudándote. 🙏'
+    }
+
+    if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+      return '💛 Para ajudar você melhor, vou transferir para nossa equipe de Front Desk. Eles confirmarão sua localização com você e continuarão ajudando. 🙏'
+    }
+
+    return '💛 To help you better, I’m transferring you to our Front Desk team. They’ll confirm your location with you and continue assisting. 🙏'
+  }
+
+  if (language.includes('spanish') || /\bes\b/.test(language)) {
+    if (isRequestedTransfer) {
+      return [
+        '💛 Claro. Te conecto ahora con nuestro equipo.',
+        '',
+        'Voy a transferirte con Customer Service para que un especialista experto en este tipo de situación pueda revisar tu caso y ayudarte con más detalle. 🙏',
+      ].join('\n')
+    }
+
+    return [
+      '💛 Entiendo tu frustración y siento mucho que estés pasando por esta situación.',
+      '',
+      'Voy a escalar tu caso ahora con nuestro equipo de Customer Service para que un especialista experto en manejar este tipo de situaciones pueda revisarlo y ayudarte con más detalle. 🙏',
+    ].join('\n')
+  }
+
+  if (language.includes('portuguese') || /\bpt\b/.test(language)) {
+    if (isRequestedTransfer) {
+      return [
+        '💛 Claro. Vou conectar você agora com nossa equipe.',
+        '',
+        'Vou transferir você para o Customer Service, para que um especialista experiente nesse tipo de situação possa revisar seu caso e ajudar com mais detalhes. 🙏',
+      ].join('\n')
+    }
+
+    return [
+      '💛 Entendo sua frustração e sinto muito que você esteja passando por essa situação.',
+      '',
+      'Vou escalar seu caso agora para nossa equipe de Customer Service, para que um especialista experiente em lidar com esse tipo de situação possa revisar tudo e ajudar com mais detalhes. 🙏',
+    ].join('\n')
+  }
+
+  if (isRequestedTransfer) {
+    return [
+      '💛 Of course. I can connect you with our team now.',
+      '',
+      'I am transferring you to Customer Service so a specialist who is experienced with this kind of situation can review your case and help you in more detail. 🙏',
+    ].join('\n')
+  }
+
+  return [
+    '💛 I understand your frustration, and I am really sorry you are dealing with this.',
+    '',
+    'I will escalate this now to our Customer Service team so a specialist who handles cases like this can review everything and help you in more detail. 🙏',
+  ].join('\n')
+}
+
+function getConversationStatus(profile = {}) {
+  const conversation = getConversation(profile)
+  const status = [
+    conversation.status,
+    conversation.conversationStatus,
+    conversation.conversation_status,
+    conversation.state,
+    profile.conversationStatus,
+  ]
+    .map((value) => String(value || '').trim())
+    .find(Boolean)
+
+  return status || ''
+}
+
+function getConversation(profile = {}) {
+  return profile.conversation || profile.rawContact?.conversation || profile.rawContact?.conversationInfo || {}
+}
+
+function normalizeAssignee(value) {
+  if (!value) {
+    return ''
+  }
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value).trim()
+  }
+
+  if (typeof value === 'object') {
+    return String(
+      value.email ||
+        value.name ||
+        value.fullName ||
+        value.full_name ||
+        value.id ||
+        value.userId ||
+        value.user_id ||
+        '',
+    ).trim()
+  }
+
+  return ''
+}
+
+function normalizeTimestamp(value) {
+  if (!value) {
+    return null
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? value : value * 1000
+  }
+
+  const parsed = Date.parse(value)
+
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+function normalizeTriggerText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+}

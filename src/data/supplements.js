@@ -1,0 +1,105 @@
+export const SUPPLEMENT_CATALOG = [
+  ['Hydrolyzed Collagen Peptides, Unflavored', '$39.90', 'Mix 1 scoop with 8–10 oz of water or another beverage daily.'],
+  ['MCT Fat Burner', '$33.90 (reg. $49.90)', 'Take 2 capsules with 8 oz of water before breakfast and 2 before dinner; maximum 4 daily.'],
+  ['Bloat Away Probiotic 40 Billion', '$24.90 (reg. $33.90)', 'Take 2 capsules daily—preferably 1 during the day and 1 in the evening.'],
+  ['Berberine+ HCL 97%', '$39.99 (reg. $59.00)', 'Take 2 capsules daily.'],
+  ['Complete Daily Multivitamin', '$33.90', 'Take 2 capsules in the morning with a meal.'],
+  ['Max Detox', '$24.90 (reg. $33.90)', 'Take 2 capsules daily—preferably 1 during the day and 1 in the evening.'],
+  ['NAD+ Cellular Energy', '$39.90 (reg. $59.90)', 'Take 2 capsules daily with 6 oz of water.'],
+  ['Vanilla Whey Protein Isolate', '$49.90 (reg. $59.90)', 'Mix 2 scoops with 6–8 oz of water or another beverage daily.'],
+  ['Gut Boost Pro', '$24.90 (reg. $33.90)', 'Take 1 capsule twice daily, preferably 20–30 minutes before a meal.', true],
+  ['Beauty Boost—Hair, Skin & Nails', '$33.90', 'Take 2 capsules daily with food. Keep at least 1 hour apart from medications.'],
+  ['Omega-3 Fish Oil', '$33.90', 'Take 1 softgel twice daily with meals.'],
+  ['Maca Plus', '$24.90', 'Take 2 capsules once daily, preferably 20–30 minutes before a meal.'],
+  ['Colon Gentle Cleanse', '$33.90', 'Mix 1 sachet with 200 ml of non-carbonated water and drink immediately, once or twice daily between meals.'],
+  ['Vitamin D3 2,000 IU', '$24.90', 'Take 1 softgel daily.'],
+  ['Chocolate Whey Isolate', '$47.90 (reg. $59.90)', 'Mix 2 scoops with 6–8 oz of water or another beverage daily.'],
+  ['Energy Oral Strips', '$29.90 (reg. $33.90)', 'Place 1 strip on the tongue and let it dissolve; maximum 1 daily.'],
+  ['Sleep Oral Strips', '$29.90 (reg. $33.90)', 'Dissolve 1 strip on the tongue, preferably before bed; maximum 1 daily.'],
+  ['Vanilla Collagen Creamer', '$39.90', 'Mix 2 scoops with 8–10 oz of a hot or cold beverage.'],
+  ['Creatine', '$33.90 (reg. $39.90)', 'For the first 5 days, mix 1 measure with 8 oz of water or juice 4 times daily. Afterward, take 1 measure once or twice daily.', true],
+  ['Brain & Focus Formula', '$24.90', 'Take 2 capsules once daily, preferably 20–30 minutes before a meal with 8 oz of water.', true],
+  ['Bone & Heart Support', '$24.90', 'Take 1 capsule twice daily, preferably 20–30 minutes before a meal.'],
+  ['Chocolate Collagen Peptides', '$39.90', 'Mix 2 scoops with 8–10 oz of a beverage.'],
+  ['Magnesium Glycinate', '$33.90', 'Take 3 capsules once daily.'],
+  ['Bloom Wow Probiotic & Prebiotic Drink', '', ''], ['Moon Plus Mood Complex', '', ''],
+  ['Vitamin D3 10,000 IU', '', 'Use only according to clinician or label guidance because this is a high dose.'],
+  ['Sleep Gel', '', ''], ['Energy Gel Rings', '', ''], ['Apple Cider Vinegar Capsules', '$39.00', ''],
+  ['Hydraglow Powder—Peach Mango', '', 'Mix 1 scoop with 14–20 oz of water; 2 scoops may be mixed with 28–40 oz.'],
+  ['Hydraglow Powder—Lychee', '', 'Mix 1 scoop with 14–20 oz of water.'],
+  ['Hydraglow Powder—Lemonade', '', 'Mix 1 scoop with 14–20 oz of water; 2 scoops may be mixed with 28–40 oz.'],
+].map(([name, price, directions, soldOut = false]) => ({ name, price, directions, soldOut }))
+
+const normalize = (value = '') => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+export function isSupplementPriceOrDirectionsQuestion(content = '') {
+  return /\b(price|prices|cost|costs|how much|take|use|directions|dose|precio|precios|cuanto|cuesta|costo|tomar|toma|usar|usa|dosis|como se|preco|quanto|custa)\b/.test(normalize(content))
+}
+
+export function isContextualSupplementQuestion(content = '', messages = []) {
+  if (!isSupplementPriceOrDirectionsQuestion(content)) return false
+  return [...messages]
+    .reverse()
+    .slice(0, 6)
+    .some(({ role, content: prior = '' }) => {
+      if (role !== 'user') return false
+      const normalized = normalize(prior)
+      const namesSupplement = /\b(supplement|supplements|suplemento|suplementos|berberine|berberina|fat burner|collagen|colageno|probiotic|vitamin|creatine|creatina|protein|proteina)\b/.test(normalized)
+      const asksAboutSupplement = /\b(want|need|interested|information|tell me|show me|price|cost|take|use|quiero|necesito|interesa|informacion|dime|muestrame|precio|cuanto|cuesta|tomar|usar|quero|preciso|interessad|informacao|preco|quanto|custa)\b/.test(normalized)
+      return namesSupplement && asksAboutSupplement && !isPastSupplementUseMention(prior)
+    })
+}
+
+export function isPastSupplementUseMention(content = '') {
+  const normalized = normalize(content)
+  const pastUse = /\b(used to take|previously took|have taken|had taken|took|was taking|tomaba|tome|he tomado|habia tomado|use to use|used|usaba|use|tomava|tomei|ja tomei|ja usei)\b/.test(normalized)
+  const pillOrSupplement = /\b(pill|pills|tablet|tablets|capsule|capsules|supplement|supplements|pastilla|pastillas|capsula|capsulas|suplemento|suplementos|comprimido|comprimidos)\b/.test(normalized)
+  return pastUse && pillOrSupplement
+}
+
+export function getPastSupplementUseAnswer(language = '') {
+  if (language === 'Latin American Spanish') {
+    return 'Gracias por compartirlo. Tambien trabajamos con algunos suplementos que pueden complementar tus objetivos. Nuestra especialista puede orientarte durante la llamada gratuita.'
+  }
+  if (language === 'Portuguese') {
+    return 'Obrigado por compartilhar. Tambem trabalhamos com alguns suplementos que podem complementar seus objetivos. Nossa especialista pode orientar voce durante a chamada gratuita.'
+  }
+  return 'Thank you for sharing that. We also offer some supplements that may complement your goals. Our specialist can guide you during the free discovery call.'
+}
+
+export function buildSupplementCatalogAnswer(language, content = '') {
+  const spanish = language === 'Latin American Spanish'
+  const query = normalize(content)
+  const asksDirections = /\b(take|use|directions|dose|tomar|toma|usar|usa|dosis|como se)\b/.test(query)
+  const aliases = query
+    .replace(/\bberberina\b/g, 'berberine')
+    .replace(/\bcolageno\b/g, 'collagen')
+    .replace(/\bcreatina\b/g, 'creatine')
+    .replace(/\bmagnesio\b/g, 'magnesium')
+    .replace(/\bproteina\b/g, 'protein')
+  const genericTokens = new Set(['complete', 'daily', 'formula', 'support', 'plus', 'boost', 'powder', 'capsules', 'isolate'])
+  const matches = SUPPLEMENT_CATALOG.filter(({ name }) => normalize(name).split(' ').filter((token) => token.length > 3 && !genericTokens.has(token)).some((token) => aliases.includes(token)))
+  const berberine = SUPPLEMENT_CATALOG.find(({ name }) => name.startsWith('Berberine+'))
+  const items = matches.length ? matches : [berberine]
+  const heading = spanish
+    ? matches.length ? 'Claro. Esta es la información del producto:' : 'Claro. Una de las primeras opciones que podemos mostrarte es Berberine+ HCL 97%:'
+    : matches.length ? 'Of course. Here is the product information:' : 'Of course. One of the first options we can show you is Berberine+ HCL 97%:'
+  const lines = items.map((item) => {
+    const price = item.price || (spanish ? 'precio no listado' : 'price not listed')
+    const stock = item.soldOut ? (spanish ? ' — agotado' : ' — sold out') : ''
+    const description = item === berberine
+      ? spanish
+        ? ' Está formulado para apoyar un metabolismo saludable de la glucosa y complementar hábitos relacionados con el control de peso.'
+        : ' It is formulated to support healthy glucose metabolism and complement habits related to weight management.'
+      : ''
+    const directions = asksDirections && item.directions ? ` ${spanish ? 'Cómo tomarlo' : 'Directions'}: ${item.directions}` : ''
+    return `- ${item.name}: ${price}${stock}.${description}${directions}`
+  })
+  const safety = spanish
+    ? 'Nuestros suplementos pueden ayudar a apoyar tu meta de pérdida de peso cuando se combinan con alimentación equilibrada y actividad física. Los resultados varían según cada persona, y podemos ayudarte a conocer las opciones que mejor complementen tu proceso.'
+    : 'Our supplements may help support your weight-loss goal when combined with balanced nutrition and physical activity. Results vary from person to person, and we can help you explore the options that may best complement your journey.'
+  const nextStep = spanish
+    ? 'Si tienes otro suplemento específico en mente, dime cuál y con gusto te comparto su precio e instrucciones. También podemos continuar con una cita para la llamada de análisis gratuita, donde nuestra especialista puede responder tus preguntas y ayudarte a revisar las opciones.'
+    : 'If you have another specific supplement in mind, tell me which one and I can share its price and directions. We can also continue with an appointment for the free discovery call, where our specialist can answer your questions and help you review the options.'
+  return [heading, ...lines, '', safety, '', nextStep].join('\n')
+}

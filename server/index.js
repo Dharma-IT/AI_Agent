@@ -1,0 +1,9245 @@
+import http from 'node:http'
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createReadStream, existsSync } from 'node:fs'
+import { extname, join, resolve } from 'node:path'
+import { buildBookedMessage, buildBookingPaymentInfoMessage } from './booked.js'
+import {
+  applyContactLeadSourceAttribution,
+  getBookingReport,
+  parseRespondMeetingStart,
+  recordBookingReportEvent,
+  shouldRecordBotAssistedBooking,
+  updateContactBookingAttribution,
+} from './bookingReportService.js'
+import { buildBookingAttemptKey, recordBookingFailureEvent } from './bookingFailureService.js'
+import { recordBookingFunnelEvent } from './bookingFunnelService.js'
+import {
+  enqueueBookingReconciliation,
+  executeIdempotentBooking,
+  runOneBookingReconciliation,
+} from './bookingReliabilityService.js'
+import { loadLocalEnv } from './env.js'
+import {
+  formatCustomerStateSlot,
+  formatCustomerStateTime,
+  getCustomerStateHour,
+  getCustomerStateDateKey,
+  getCustomerStateMinutesOfDay,
+  getStateTimeZone,
+} from './timezones.js'
+import {
+  NON_SERVICEABLE_LOCATIONS,
+  US_STATES,
+  isPrescribedTreatmentDeliveryState,
+} from '../src/data/states.js'
+import { CITY_STATE_OPTIONS } from '../src/data/usCityStates.js'
+import { buildGlp1PricingAnswer } from '../src/data/glp1Pricing.js'
+import { detectLatestMessageLanguage } from '../src/utils/conversationLanguage.js'
+import {
+  isGhkProductQuestion,
+  isOralProductQuestion,
+  isReboundEffectQuestion,
+  isSupplementProductQuestion,
+  isPrescribedTreatmentDeclination,
+  isTreatmentPackageInclusionsQuestion,
+} from '../src/utils/leadIntentRules.js'
+import {
+  chooseConfirmedState,
+  chooseExplicitOrNextAvailabilityPreference,
+  extractExplicitAvailabilityAlternative,
+  confirmsOfferedSlotTime,
+  findStateNameWithMinorTypo,
+  getMinimumStartAfterSlotRejection,
+  getLaterSlotDelayMs,
+  getCallFormatAnswer,
+  getUnrecognizedStateAttemptResult,
+  hasCallFormatQuestion,
+  hasStrictRequestedDay,
+  isEarlierSchedulingPreference,
+  isExactCasualAffirmative,
+  isGeneratedSlotReofferLine,
+  isRecognizedStateQualificationReply,
+  looksLikeExplicitStateDeclaration,
+  parseAfterTimePreference,
+  shouldAcceptStateAbbreviationToken,
+  shouldTreatOkAsAffirmative,
+  rejectsOfferedCalendarDate,
+  resolveKansasLocationClarification,
+} from '../src/utils/bookingRules.js'
+import {
+  applyDefaultAvailabilityRule,
+  extractAfterWorkConstraint,
+  extractAvailabilityMonth,
+  extractAvailabilityMonthDay,
+  extractPositiveDayPartConstraint,
+} from '../src/utils/availabilityRules.js'
+import {
+  buildPostBookingLock,
+  expirePostBookingLock,
+  getPostBookingLock,
+  isPostBookingLockActive,
+  isPostBookingLockEnabled,
+  isPostBookingLockExpired,
+  savePostBookingLock,
+  shouldRestorePostBookingAssignee,
+} from './postBookingLockService.js'
+import {
+  buildHumanTakeoverLock,
+  closeHumanTakeoverLock,
+  expireHumanTakeoverLock,
+  getHumanTakeoverLock,
+  isHumanTakeoverLockActive,
+  isHumanTakeoverLockExpired,
+  saveHumanTakeoverLock,
+} from './humanTakeoverLockService.js'
+import {
+  bookCustomerServiceMeeting,
+  bookPrioritySellerMeeting,
+  checkBookingCalendarHealth,
+  reconcileCustomerServiceMeeting,
+  reconcilePrioritySellerMeeting,
+  findHubSpotContactByEmail,
+  getConfiguredCustomerServiceTeam,
+  getConfiguredFrontDeskTeam,
+  getCustomerServiceAvailability,
+  getNewClientAvailability,
+  getPrioritySellerAvailability,
+  isMeetingOptionAvailable,
+  parsePreferredTime,
+  resolveBookingTeamForOption,
+} from './hubspotService.js'
+import { formatKnowledgeContext, ingestKnowledgeFolder, searchKnowledge } from './ragService.js'
+import {
+  approveMemorySuggestion,
+  createManualMemory,
+  formatMemoryContext,
+  listPendingMemorySuggestions,
+  rejectMemorySuggestion,
+  searchApprovedMemories,
+  suggestMemoryFromConversation,
+} from './memoryService.js'
+import {
+  assignRespondConversation,
+  getRespondContact,
+  sendRespondImageMessage,
+  sendRespondTextMessage,
+  sendRespondVideoMessage,
+  unassignRespondConversation,
+  updateRespondContact,
+} from './respondService.js'
+import {
+  buildRespondTransferMessage,
+  detectRespondTransferTrigger,
+  getRespondAutomationDecision,
+  getConversationAssignee,
+  isConversationAssigned,
+  isConversationClosed,
+  isDoctorOrProviderQuestion,
+  isGeneralProductOrMedicationClarification,
+  isRespondImageMessage,
+  isRespondUnsupportedMessage,
+} from './transfer.js'
+import {
+  createDummyEmailFromProvidedPhone,
+  extractUsPhoneNumber,
+  hasConfirmedFullName,
+  isCustomerServiceBookingStatus,
+  isUsCountryCodePhone,
+  mergeCustomerNameReply,
+  normalizeUsPhoneNumber,
+  removeAvailabilitySignalsFromNameReply,
+  shouldUseNewClientBookingFlow,
+} from './newClientFlow.js'
+import {
+  hasExplicitNamedPersonMedicationQuestion,
+  isExplicitThirdPartyMedicationQuestion,
+  isGeneralProductInfoRequest,
+  isGeneralMedicationSafetyQuestion,
+} from './privacyGuard.js'
+import { isTreatmentAcquisitionQuestion } from '../src/utils/privacyRules.js'
+import { getCanonicalStateAlias } from '../src/utils/stateAliases.js'
+import {
+  buildSupplementCatalogAnswer,
+  getPastSupplementUseAnswer,
+  isContextualSupplementQuestion,
+  isPastSupplementUseMention,
+} from '../src/data/supplements.js'
+import { hasAffordabilityObjection, isContextualAffordabilityObjection } from '../src/utils/affordabilityRules.js'
+import {
+  getInjectionFrequencyAnswer,
+  isInjectionFrequencyQuestion,
+} from '../src/utils/injectionFrequencyRules.js'
+import { createRespondMessageCoordinator } from './respondMessageCoordinator.js'
+import { withRespondContactLock } from './respondProcessingService.js'
+import { recheckRespondAssignment } from './respondAssignmentRecheckService.js'
+import { acquireSlotClaim, buildPersistedSlotClaim, releaseSlotClaim } from './slotClaimService.js'
+import {
+  classifyBookingFailure,
+  getInitialConsultationCostAnswer,
+  getInsuranceAnswer,
+  isGeneralZepboundQuestion,
+  isInitialConsultationCostQuestion,
+  isInsuranceQuestion,
+  isGeneratedBookingPromptLine,
+  hasKnownRespondBookingPhone,
+  extractRespondContactPhone,
+  resolveRespondContactStatus,
+} from './respondConversationRules.js'
+import {
+  clearRespondSessions as clearStoredRespondSessions,
+  deleteRespondSession as deleteStoredRespondSession,
+  loadRespondSession,
+  saveRespondSession,
+} from './respondSessionService.js'
+
+loadLocalEnv()
+
+const PORT = Number(process.env.PORT || process.env.API_PORT || 8787)
+const DEFAULT_MODEL = 'gpt-4.1-mini'
+const DIST_DIR = resolve(process.cwd(), 'dist')
+const RESPOND_AGENT = {
+  id: 'sales',
+  systemPrompt:
+    process.env.RESPOND_AGENT_SYSTEM_PROMPT ||
+    'You are Maria from Dharma Clinic. You help inbound customers politely, answer from company knowledge, collect the next missing detail, and guide qualified leads toward a free online discovery call when appropriate.',
+}
+const SESSION_RESTART_WINDOW_MS =
+  Number(process.env.RESPOND_SESSION_RESTART_WINDOW_HOURS || 24) * 60 * 60 * 1000
+const EXISTING_CLIENT_NO_RESPONSE_MS =
+  Number(process.env.RESPOND_EXISTING_CLIENT_NO_RESPONSE_MINUTES || 10) * 60 * 1000
+const EXISTING_CLIENT_AUTOMATION_LOCK_MS =
+  Number(process.env.RESPOND_EXISTING_CLIENT_AUTOMATION_LOCK_HOURS || 24) * 60 * 60 * 1000
+const INITIAL_IMAGE_URL = process.env.RESPOND_INITIAL_IMAGE_URL || getDefaultInitialImageUrl()
+const BOOKING_CONFIRMATION_VIDEO_URL =
+  process.env.RESPOND_BOOKING_CONFIRMATION_VIDEO_URL ||
+  process.env.RESPOND_INITIAL_VIDEO_URL ||
+  getDefaultBookingConfirmationVideoUrl()
+const INITIAL_GREETING_BY_LANGUAGE = {
+  English: `Hi, my name is Maria from Dharma Clinic. 👋
+
+It is a pleasure to have you here. Take a look at our Instagram *@dharma.clinic* 📸.
+
+📍 We are a U.S.-based telemedicine company providing online care in 43 states.
+
+💰*BEST-SELLING PRICE:*
+
+*$589* – Package of up to 4 weeks of personalized GLP-1
+
+We have longer treatments to help you reach your goal.
+
+📲 First, we do a *free* analysis call by video.
+
+💥 *SPECIAL OFFER TODAY ONLY* 💥`,
+  'Latin American Spanish': `Hola, mi nombre es Maria, de la clínica Dharma. 👋
+
+Es un placer tenerte aquí, echa un vistazo a nuestro Instagram *@dharma.clinic* 📸.
+
+📍 Somos una empresa de telemedicina ubicada en EE.UU. y atendemos online en 43 estados.
+
+💰*PRECIO DE LO MÁS VENDIDO:*
+
+*$589* – Paquete de hasta 4 semanas de GLP-1 personalizado
+
+Tenemos tratamientos más largos para que pueda alcanzar su objetivo.
+
+📲 Primero realizamos una llamada de análisis *gratuita* por videollamada.
+
+💥 *OFERTA ESPECIAL SOLO HOY* 💥`,
+  Portuguese: `Olá, meu nome é Maria, da clínica Dharma. 👋
+
+É um prazer ter você aqui, dê uma olhada no nosso Instagram *@dharma.clinic* 📸.
+
+📍 Somos uma empresa de telemedicina localizada nos EUA e atendemos online em 43 estados.
+
+💰*PREÇO DO MAIS VENDIDO:*
+
+*$589* – Pacote de até 4 semanas de GLP-1 personalizado
+
+Temos tratamentos mais longos para que você possa alcançar seu objetivo.
+
+📲 Primeiro, realizamos uma chamada de análise *gratuita* por videochamada.
+
+💥 *OFERTA ESPECIAL SOMENTE HOJE* 💥`,
+}
+const INITIAL_STATE_QUESTION_BY_LANGUAGE = {
+  English: '📍Please tell us which state you live in to find out if we ship to your state?',
+  'Latin American Spanish':
+    '📍Dime por favor en que estado vives para saber si hacemos envios a su Estado?',
+  Portuguese:
+    '📍Por favor, me informe em que estado você mora para saber se fazemos entregas para o seu Estado?',
+}
+const respondSessions = new Map()
+const existingClientNoResponseTimers = new Map()
+const respondSessionPersistenceQueues = new Map()
+const pendingPostBookingAssignments = new Map()
+const respondMessageCoordinator = createRespondMessageCoordinator({
+  debounceMs: Number(process.env.RESPOND_MESSAGE_BUFFER_MS || 3000),
+})
+
+const MIME_TYPES = {
+  '.css': 'text/css',
+  '.html': 'text/html',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript',
+  '.json': 'application/json',
+  '.mp4': 'video/mp4',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain',
+  '.webp': 'image/webp',
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
+    const pathname = url.pathname
+
+    if (pathname === '/api/reports/bookings') {
+      const corsAllowed = applyReportCors(request, response)
+      if (!corsAllowed) {
+        sendJson(response, 403, { error: 'This origin is not allowed to access booking reports.' })
+        return
+      }
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204)
+        response.end()
+        return
+      }
+    }
+
+    if (request.method === 'GET' && (pathname === '/api/health' || pathname === '/health')) {
+      sendJson(response, 200, {
+        ok: true,
+        version: String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '').slice(0, 7),
+      })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/chat') {
+      await handleChat(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/knowledge/ingest') {
+      await handleKnowledgeIngest(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/knowledge/search') {
+      await handleKnowledgeSearch(request, response)
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/memory/suggestions') {
+      await handleMemorySuggestions(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/memory') {
+      await handleMemoryCreate(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/memory/search') {
+      await handleMemorySearch(request, response)
+      return
+    }
+
+    const memorySuggestionMatch = pathname.match(/^\/api\/memory\/suggestions\/([^/]+)\/(approve|reject)$/)
+
+    if (request.method === 'POST' && memorySuggestionMatch) {
+      await handleMemorySuggestionReview(memorySuggestionMatch, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/hubspot/availability') {
+      await handleHubSpotAvailability(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/hubspot/book-meeting') {
+      await handleHubSpotBookMeeting(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/hubspot/contact-lookup') {
+      await handleHubSpotContactLookup(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/respond/contact-lookup') {
+      await handleRespondContactLookup(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/respond/session/reset') {
+      await handleRespondSessionReset(request, response)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/respond/webhook') {
+      await handleRespondWebhook(request, response, url)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/respond/attribution') {
+      await handleRespondAttribution(request, response)
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/reports/bookings') {
+      await handleBookingReport(response, url)
+      return
+    }
+
+    if (request.method === 'GET') {
+      await serveStaticFile(pathname, response)
+      return
+    }
+
+    sendJson(response, 404, { error: 'Not found' })
+  } catch (error) {
+    console.error(error)
+    sendJson(response, 500, { error: error.message || 'Internal server error' })
+  }
+})
+
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`)
+})
+
+let bookingReconciliationRunning = false
+const bookingReconciliationTimer = setInterval(() => {
+  if (bookingReconciliationRunning) return
+  bookingReconciliationRunning = true
+  runOneBookingReconciliation({ handler: reconcileBookingJob })
+    .catch((error) => console.warn(`[booking-reconciliation-worker] ${error.message}`))
+    .finally(() => { bookingReconciliationRunning = false })
+}, Number(process.env.BOOKING_RECONCILIATION_INTERVAL_MS || 30_000))
+bookingReconciliationTimer.unref?.()
+
+async function logBookingCalendarHealth() {
+  const results = await checkBookingCalendarHealth()
+  for (const result of results) {
+    if (result.status !== 'healthy') console.warn('[booking-calendar-health]', result)
+  }
+}
+const calendarHealthTimer = setInterval(() => {
+  logBookingCalendarHealth().catch((error) => console.warn(`[booking-calendar-health] ${error.message}`))
+}, Number(process.env.BOOKING_CALENDAR_HEALTH_INTERVAL_MS || 15 * 60_000))
+calendarHealthTimer.unref?.()
+setTimeout(() => {
+  logBookingCalendarHealth().catch((error) => console.warn(`[booking-calendar-health] ${error.message}`))
+}, 60_000).unref?.()
+
+async function reconcileBookingJob(job) {
+  const { customer, option, bookingTeam } = job.payload || {}
+  if (!customer || !option) throw new Error('Booking reconciliation payload is incomplete.')
+  const reconcileMeeting = bookingTeam === 'customer_service'
+    ? reconcileCustomerServiceMeeting
+    : reconcilePrioritySellerMeeting
+  const booked = await reconcileMeeting({ customer, option })
+  if (!booked) {
+    const error = new Error('The booked HubSpot meeting is not visible yet.')
+    error.status = 503
+    throw error
+  }
+  const incomplete = [booked.dealSync, booked.appointmentContactSync, booked.workflowEnrollment]
+    .find((result) => result && result.ok === false)
+  if (incomplete) {
+    const error = new Error(incomplete.error || 'A downstream booking update is still incomplete.')
+    error.status = 503
+    throw error
+  }
+  await updateRespondContactStatusAfterBooking(job.respond_contact_id, { throwOnError: true })
+  if (isPostBookingLockEnabled()) {
+    const assignment = await assignRespondConversationAfterBooking({ contactId: job.respond_contact_id, booked, option })
+    if (!assignment?.assigned) {
+      const error = new Error('Respond specialist assignment is still incomplete.')
+      error.status = 503
+      throw error
+    }
+  }
+  return booked
+}
+
+async function serveStaticFile(pathname, response) {
+  const normalizedPath = pathname === '/' ? '/index.html' : pathname
+  const requestedPath = resolve(DIST_DIR, `.${decodeURIComponent(normalizedPath)}`)
+  const indexPath = join(DIST_DIR, 'index.html')
+  const filePath =
+    requestedPath.startsWith(DIST_DIR) && existsSync(requestedPath)
+      ? requestedPath
+      : indexPath
+
+  if (!existsSync(filePath)) {
+    sendJson(response, 404, { error: 'Frontend build not found. Run npm run build first.' })
+    return
+  }
+
+  response.writeHead(200, {
+    'Content-Type': MIME_TYPES[extname(filePath)] || 'application/octet-stream',
+  })
+
+  createReadStream(filePath).pipe(response)
+}
+
+async function handleChat(request, response) {
+  const apiKey = process.env.OPENAI_API_KEY
+
+  if (!apiKey) {
+    sendJson(response, 500, { error: 'OPENAI_API_KEY is not configured.' })
+    return
+  }
+
+  const body = await readJsonBody(request)
+  const model = body.model || process.env.OPENAI_MODEL || DEFAULT_MODEL
+  const ragContext = await buildRagContext(body)
+  const memoryContext = await buildMemoryContext(body)
+  const customerLanguage = resolveCustomerLanguage(body)
+  const redundancyControl = buildRedundancyControl(body)
+  const instructions = buildInstructions({ ...body, customerLanguage, redundancyControl })
+  const input = buildInput({
+    ...body,
+    customerLanguage,
+    redundancyControl,
+    context: [body.context, memoryContext, ragContext].filter(Boolean).join('\n\n'),
+  })
+
+  const text = await createOpenAIResponseText({ model, instructions, input })
+
+  sendJson(response, 200, {
+    model,
+    text,
+    message: {
+      role: 'agent',
+      content: text,
+    },
+  })
+
+  queueMemorySuggestion({
+    agentId: body.agent?.id || 'sales',
+    messages: body.messages || [],
+    agentReply: text,
+    source: 'dashboard_chat',
+  })
+}
+
+async function createOpenAIResponseText({ model, instructions, input }) {
+  const apiKey = process.env.OPENAI_API_KEY
+
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY is not configured.')
+  }
+
+  const openaiResponse = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      instructions,
+      input,
+    }),
+  })
+
+  const data = await openaiResponse.json()
+
+  if (!openaiResponse.ok) {
+    throw new Error(data.error?.message || 'OpenAI request failed.')
+  }
+
+  return extractOutputText(data)
+}
+
+async function handleKnowledgeIngest(request, response) {
+  const body = await readJsonBody(request)
+  const results = await ingestKnowledgeFolder({
+    bucket: body.bucket,
+    prefix: body.prefix,
+    agentId: body.agentId || 'sales',
+    sourceType: body.sourceType,
+  })
+
+  sendJson(response, 200, {
+    indexedFiles: results.length,
+    results,
+  })
+}
+
+async function handleKnowledgeSearch(request, response) {
+  const body = await readJsonBody(request)
+  const matches = await searchKnowledge({
+    query: body.query,
+    agentId: body.agentId || 'sales',
+    sourceTypes: body.sourceTypes,
+    matchCount: body.matchCount,
+  })
+
+  sendJson(response, 200, { matches })
+}
+
+async function handleMemorySuggestions(request, response) {
+  const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
+  const suggestions = await listPendingMemorySuggestions({
+    limit: Number(url.searchParams.get('limit') || 50),
+  })
+
+  sendJson(response, 200, { suggestions })
+}
+
+async function handleMemoryCreate(request, response) {
+  const body = await readJsonBody(request)
+  const memory = await createManualMemory({
+    agentId: body.agentId || 'sales',
+    category: body.category,
+    content: body.content,
+    source: body.source || 'manual',
+  })
+
+  sendJson(response, 200, { memory })
+}
+
+async function handleMemorySearch(request, response) {
+  const body = await readJsonBody(request)
+  const matches = await searchApprovedMemories({
+    query: body.query,
+    agentId: body.agentId || 'sales',
+    matchCount: body.matchCount || 5,
+  })
+
+  sendJson(response, 200, { matches })
+}
+
+async function handleMemorySuggestionReview(match, response) {
+  const [, id, action] = match
+  const result =
+    action === 'approve'
+      ? { memory: await approveMemorySuggestion(id) }
+      : { suggestion: await rejectMemorySuggestion(id) }
+
+  sendJson(response, 200, result)
+}
+
+async function handleHubSpotAvailability(request, response) {
+  const body = await readJsonBody(request)
+  let options = await getPrioritySellerAvailability({
+    limit: Number.isInteger(body.earliestHour) || body.latestStartTime ? 100 : body.limit || 6,
+    preferredTime: body.preferredTime,
+    preferredSpecialist: body.preferredSpecialist,
+    timezone: getStateTimeZone(body.state),
+    language: body.language,
+  })
+
+  if (Number.isInteger(body.earliestHour) || body.latestStartTime) {
+    options = options.filter((option) => {
+      const localHour = getCustomerStateHour(option.startTime, body.state, option.timezone)
+      if (Number.isInteger(body.earliestHour) && localHour < body.earliestHour) return false
+      if (body.latestStartTime && Number(option.startTime) >= Number(body.latestStartTime)) return false
+      return true
+    })
+  }
+
+  sendJson(response, 200, { options: options.slice(0, body.limit || 6) })
+}
+
+async function handleHubSpotBookMeeting(request, response) {
+  const body = await readJsonBody(request)
+  const booking = await bookPrioritySellerMeeting({
+    customer: body.customer,
+    option: body.option,
+  })
+
+  sendJson(response, 200, { booking })
+}
+
+async function handleHubSpotContactLookup(request, response) {
+  const body = await readJsonBody(request)
+  const contact = await findHubSpotContactByEmail(body.email)
+
+  sendJson(response, 200, {
+    exists: Boolean(contact),
+    contact: contact
+      ? {
+        id: contact.id,
+        properties: contact.properties,
+      }
+      : null,
+  })
+}
+
+async function handleRespondContactLookup(request, response) {
+  const body = await readJsonBody(request)
+  const contact = await getRespondContact(body.contactId)
+
+  sendJson(response, 200, { contact })
+}
+
+async function handleRespondSessionReset(request, response) {
+  const body = await readJsonBody(request)
+
+  if (body.all === true) {
+    const cleared = respondSessions.size
+    respondSessions.clear()
+    await clearStoredRespondSessions()
+    sendJson(response, 200, { ok: true, cleared })
+    return
+  }
+
+  if (!body.contactId) {
+    sendJson(response, 400, { error: 'contactId is required unless all is true.' })
+    return
+  }
+
+  const contactId = String(body.contactId)
+  const existed = removeRespondSession(contactId)
+
+  sendJson(response, 200, { ok: true, contactId, cleared: existed ? 1 : 0 })
+}
+
+async function handleRespondWebhook(request, response) {
+  const rawBody = await readRawBody(request)
+
+  if (!isValidRespondWebhookRequest(request, rawBody)) {
+    sendJson(response, 401, { error: 'Invalid webhook signature.' })
+    return
+  }
+
+  const body = parseJsonBody(rawBody)
+  const event = normalizeRespondWebhookEvent(body)
+
+  if (!isAllowedRespondChannel(event.channelId)) {
+    sendJson(response, 200, {
+      ok: true,
+      skipped: true,
+      reason: event.channelId
+        ? `Ignoring channel ${event.channelId}.`
+        : 'No channel ID found on webhook event.',
+    })
+    return
+  }
+
+  if (event.contactId && Object.keys(event.attribution || {}).length) {
+    await hydrateRespondSession(event.contactId)
+    const session = getRespondSession(event.contactId)
+    setRespondSession(event.contactId, {
+      ...session,
+      attribution: mergeRespondAttribution(session.attribution, event.attribution),
+    })
+  }
+
+  if (event.contactId && !event.text && !event.isVoiceMessage && !event.isImageMessage && !event.isUnsupportedMessage) {
+    await handleRespondConversationStateEvent(event)
+  }
+
+  if (!event.contactId || (!event.text && !event.isVoiceMessage && !event.isImageMessage && !event.isUnsupportedMessage) || !event.isIncoming) {
+    sendJson(response, 200, {
+      ok: true,
+      skipped: true,
+      reason: event.skipReason || 'No incoming text message found.',
+    })
+    return
+  }
+
+  const coordinatedMessage = respondMessageCoordinator.enqueue({
+    contactId: event.contactId,
+    messageId: event.messageId,
+    task: ({ messageIds = [] } = {}) => withRespondContactLock({
+      contactId: event.contactId,
+      messageId: event.messageId,
+      messageIds,
+      task: async () => {
+        await refreshRespondSession(event.contactId)
+        try {
+          return await processRespondIncomingMessage(event)
+        } finally {
+          await waitForRespondSessionPersistence(event.contactId)
+        }
+      },
+    }),
+  })
+
+  if (coordinatedMessage.duplicate) {
+    sendJson(response, 200, { ok: true, skipped: true, reason: 'Duplicate Respond message.' })
+    return
+  }
+
+  sendJson(response, 200, { ok: true, accepted: true })
+
+  coordinatedMessage.promise.catch((error) => {
+    console.error('Respond webhook processing failed:', error)
+  })
+}
+
+async function handleBookingReport(response, url) {
+  const report = await getBookingReport({
+    from: url.searchParams.get('from') || '',
+    to: url.searchParams.get('to') || '',
+  })
+  sendJson(response, 200, report)
+}
+
+async function handleRespondAttribution(request, response) {
+  const configuredKey = String(process.env.RESPOND_ATTRIBUTION_WEBHOOK_KEY || '').trim()
+  const providedKey = String(
+    request.headers['x-api-key'] || String(request.headers.authorization || '').replace(/^Bearer\s+/i, ''),
+  ).trim()
+  if (configuredKey && providedKey !== configuredKey) {
+    sendJson(response, 401, { error: 'Invalid attribution webhook key.' })
+    return
+  }
+
+  const body = await readJsonBody(request)
+  const contactId = String(
+    body.contactId || body.contact_id || body.respondContactId || body.respond_contact_id || '',
+  ).trim()
+  if (!contactId) {
+    sendJson(response, 400, { error: 'contactId is required.' })
+    return
+  }
+
+  const attribution = extractRespondAttribution(body)
+  if (!attribution.type) {
+    sendJson(response, 400, { error: 'No Meta or TikTok ad attribution was found in the payload.' })
+    return
+  }
+
+  await hydrateRespondSession(contactId)
+  const session = getRespondSession(contactId)
+  const mergedAttribution = mergeRespondAttribution(session.attribution, attribution)
+  setRespondSession(contactId, { ...session, attribution: mergedAttribution })
+  await waitForRespondSessionPersistence(contactId)
+  const updatedBookings = await updateContactBookingAttribution({
+    contactId,
+    attribution: mergedAttribution,
+  })
+
+  sendJson(response, 200, {
+    ok: true,
+    contactId,
+    attribution: mergedAttribution,
+    updatedBookings: updatedBookings.length,
+  })
+}
+
+function isValidRespondWebhookRequest(request, rawBody) {
+  const signingKey = process.env.RESPOND_WEBHOOK_SIGNING_KEY
+
+  if (!signingKey) {
+    return true
+  }
+
+  const signature =
+    request.headers['x-webhook-signature'] ||
+    request.headers['x-respond-signature'] ||
+    request.headers['respond-signature'] ||
+    request.headers['x-signature']
+
+  if (!signature || Array.isArray(signature)) {
+    return false
+  }
+
+  return verifyWebhookSignature({
+    signingKey,
+    rawBody,
+    signature,
+  })
+}
+
+function verifyWebhookSignature({ signingKey, rawBody, signature }) {
+  const normalizedSignature = normalizeSignature(signature)
+  const keyCandidates = [Buffer.from(signingKey, 'utf8')]
+
+  try {
+    keyCandidates.push(Buffer.from(signingKey, 'base64'))
+  } catch {
+    // The signing key may be plain text rather than base64.
+  }
+
+  const digestEncodings = ['hex', 'base64']
+
+  for (const key of keyCandidates) {
+    for (const encoding of digestEncodings) {
+      const expected = createHmac('sha256', key).update(rawBody).digest(encoding)
+
+      if (constantTimeEquals(normalizedSignature, normalizeSignature(expected))) {
+        return true
+      }
+    }
+  }
+
+  return false
+}
+
+function normalizeSignature(signature) {
+  return String(signature || '').trim().replace(/^sha256=/i, '')
+}
+
+function constantTimeEquals(left, right) {
+  const leftBuffer = Buffer.from(left)
+  const rightBuffer = Buffer.from(right)
+
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer)
+}
+
+function isAllowedRespondChannel(channelId) {
+  const allowedChannelIds = parseCsvEnv(process.env.RESPOND_ALLOWED_CHANNEL_IDS)
+
+  if (allowedChannelIds.length === 0) {
+    return true
+  }
+
+  return Boolean(channelId && allowedChannelIds.includes(String(channelId)))
+}
+
+function parseCsvEnv(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function getDefaultInitialImageUrl() {
+  const baseUrl =
+    process.env.WEB_SERVICE_URL ||
+    process.env.VITE_WEB_SERVICE_URL ||
+    'https://dharma-agent-yd5l.onrender.com'
+
+  return `${baseUrl.replace(/\/+$/, '')}/Images/55lbs.png`
+}
+
+async function handleRespondConversationStateEvent(event) {
+  await hydrateRespondSession(event.contactId)
+  const session = getRespondSession(event.contactId)
+
+  await maybeRecordBotAssistedBooking(event.contactId, session).catch((error) => {
+    console.warn(`Unable to record bot-assisted booking: ${error.message}`)
+  })
+
+  const pendingBookingAssignment = pendingPostBookingAssignments.get(event.contactId)
+  if (pendingBookingAssignment && pendingBookingAssignment > Date.now()) {
+    console.log('[respond-human-takeover-skipped-booking-assignment]', {
+      contactId: event.contactId,
+    })
+    return
+  }
+
+  const postBookingLock = await getPostBookingLock(event.contactId, session.postBookingLock)
+  if (isPostBookingLockActive(postBookingLock)) {
+    const currentAssignee = event.isConversationUnassignedEvent ? '' : event.assignee
+    if (shouldRestorePostBookingAssignee({
+      lock: postBookingLock,
+      currentAssignee,
+      conversationClosed: event.isConversationClosedEvent,
+    })) {
+      await assignRespondConversationToPostBookingHolder({
+        contactId: event.contactId,
+        assignee: postBookingLock.assignee,
+      }).catch((error) => {
+        console.warn(`Unable to restore Respond post-booking assignment: ${error.message}`)
+      })
+    }
+    return
+  }
+  if (postBookingLock) return
+
+  if (event.isConversationUnassignedEvent) {
+    await expireHumanTakeoverLock(event.contactId, 'cancelled').catch((error) => {
+      console.warn(error.message)
+    })
+    console.log('[respond-human-takeover-unassigned]', { contactId: event.contactId })
+    return
+  }
+
+  let humanLock = await getHumanTakeoverLock(event.contactId, session.humanTakeoverLock)
+
+  if (event.isConversationAssignmentEvent && !event.isConversationClosedEvent) {
+    let assignee = event.assignee
+
+    if (!assignee) {
+      const profile = await getRespondContactProfile(event.contactId, session.respondContactProfile)
+      assignee = getConversationAssignee(profile)
+    }
+
+    if (assignee) {
+      humanLock = buildHumanTakeoverLock({
+        contactId: event.contactId,
+        assignee,
+        assignedAt: event.timestamp || Date.now(),
+      })
+      await saveHumanTakeoverLock(humanLock).catch((error) => console.warn(error.message))
+      setRespondSession(event.contactId, {
+        ...session,
+        humanTakeoverLock: humanLock,
+        lastInteractionAt: Date.now(),
+      })
+      console.log('[respond-human-takeover-assigned]', {
+        contactId: event.contactId,
+        assignee,
+      })
+    }
+  }
+
+  if (event.isConversationClosedEvent) {
+    if (!humanLock) {
+      const profile = await getRespondContactProfile(event.contactId, session.respondContactProfile)
+      const assignee = event.assignee || getConversationAssignee(profile)
+      humanLock = buildHumanTakeoverLock({
+        contactId: event.contactId,
+        assignee,
+        assignedAt: event.timestamp || Date.now(),
+      })
+    }
+
+    const closedLock = closeHumanTakeoverLock(humanLock, event.timestamp || Date.now())
+    if (closedLock) {
+      await saveHumanTakeoverLock(closedLock).catch((error) => console.warn(error.message))
+    }
+
+    const nextSession = {
+      ...session,
+      ...(session.transferHandoffAt || session.handoffAt ? { transferClosedAt: Date.now() } : {}),
+      ...(closedLock ? { humanTakeoverLock: closedLock } : {}),
+      lastInteractionAt: Date.now(),
+    }
+    setRespondSession(event.contactId, nextSession)
+    console.log('[respond-conversation-closed]', {
+      contactId: event.contactId,
+      eventName: event.eventName,
+      humanTakeoverLockedUntil: closedLock
+        ? new Date(closedLock.lockedUntil).toISOString()
+        : '',
+    })
+  }
+}
+
+function getBotEngagementSessionFields(session = {}, respondContactProfile = {}) {
+  return {
+    botEngagedAt: Number(session.botEngagedAt || Date.now()),
+    botEngagedInitialContactStatus:
+      session.botEngagedInitialContactStatus ||
+      respondContactProfile?.exactContactStatus ||
+      respondContactProfile?.fields?.contactStatus ||
+      '',
+  }
+}
+
+async function maybeRecordBotAssistedBooking(contactId, session = {}) {
+  if (!session.botEngagedAt || session.botAssistedReportRecordedAt) return null
+
+  const contact = await getRespondContact(contactId)
+  const customFields = getRespondCustomFieldMap(contact)
+  const currentContactStatus = resolveRespondContactStatus(customFields, contact)
+
+  if (!shouldRecordBotAssistedBooking({
+    botEngagedAt: session.botEngagedAt,
+    initialContactStatus: session.botEngagedInitialContactStatus,
+    currentContactStatus,
+  })) return null
+
+  const meetingStart = parseRespondMeetingStart(
+    customFields.date_of_meeting,
+    customFields.time_of_meeting,
+  )
+  if (!meetingStart) return null
+
+  const leadSource = getRespondLeadSource(customFields)
+  const attribution = {
+    ...applyContactLeadSourceAttribution(session.attribution || {}, leadSource),
+    ...session.attribution,
+    leadSource,
+    botAssisted: true,
+    bookingCredit: 'bot_assisted',
+    evidence: 'Respond API/template engaged contact before Evaluation Scheduled workflow',
+  }
+  const recorded = await recordBookingReportEvent({
+    contactId,
+    contactPhone: extractRespondContactPhone(contact, customFields),
+    attribution,
+    booked: { startTime: meetingStart },
+    option: { startTime: meetingStart },
+  })
+
+  setRespondSession(contactId, {
+    ...session,
+    botAssistedReportRecordedAt: Date.now(),
+  })
+  console.log('[respond-bot-assisted-booking-recorded]', {
+    contactId,
+    meetingStartAt: new Date(meetingStart).toISOString(),
+    reportId: recorded?.id || '',
+  })
+  return recorded
+}
+
+function getDefaultBookingConfirmationVideoUrl() {
+  const baseUrl =
+    process.env.WEB_SERVICE_URL ||
+    process.env.VITE_WEB_SERVICE_URL ||
+    'https://dharma-agent-yd5l.onrender.com'
+
+  return `${baseUrl.replace(/\/+$/, '')}/Images/Spanish.mp4`
+}
+
+async function sendBookingConfirmationVideo({ contactId, channelId }) {
+  if (!BOOKING_CONFIRMATION_VIDEO_URL) {
+    return null
+  }
+
+  return sendRespondVideoMessage({
+    contactId,
+    channelId,
+    videoUrl: BOOKING_CONFIRMATION_VIDEO_URL,
+  }).catch((error) => {
+    console.warn(`Unable to send booking confirmation video: ${error.message}`)
+    return null
+  })
+}
+
+async function processRespondIncomingMessage(event) {
+  await hydrateRespondSession(event.contactId)
+  let session = getRespondSession(event.contactId)
+
+  if (Number(session.existingClientAutomationLockedUntil) > Date.now()) {
+    console.log('[respond-existing-client-automation-locked]', {
+      contactId: event.contactId,
+      lockedUntil: new Date(session.existingClientAutomationLockedUntil).toISOString(),
+    })
+    return
+  }
+
+  if (Number(session.existingClientNoResponseDueAt) > 0) {
+    if (Number(session.existingClientNoResponseDueAt) <= Date.now()) {
+      await finalizeExistingClientNoResponseHandoff(event.contactId)
+      return
+    }
+
+    cancelExistingClientNoResponseHandoff(event.contactId)
+    session = setRespondSession(event.contactId, {
+      ...session,
+      existingClientNoResponseDueAt: null,
+    })
+  }
+
+  let respondContactProfile = await getRespondContactProfile(event.contactId, session.respondContactProfile)
+  respondContactProfile = mergeRespondContactProfileFallbacks(respondContactProfile, {
+    phone: event.contactPhone,
+  })
+  respondContactProfile.contactId = event.contactId
+  const assignmentRecheck = await recheckRespondAssignment({
+    initialProfile: respondContactProfile,
+    isAssigned: isConversationAssigned,
+    loadProfile: (fallbackProfile) => getRespondContactProfile(event.contactId, fallbackProfile),
+    normalizeProfile: (profile) => mergeRespondContactProfileFallbacks(profile, {
+      phone: event.contactPhone,
+    }),
+  })
+  respondContactProfile = assignmentRecheck.profile
+  respondContactProfile.contactId = event.contactId
+  const attribution = applyContactLeadSourceAttribution(
+    mergeRespondAttribution(session.attribution, event.attribution),
+    respondContactProfile.leadSource,
+  )
+
+  if (assignmentRecheck.rechecked) {
+    console.log(
+      assignmentRecheck.released
+        ? '[respond-workflow-unassigned-resume]'
+        : '[respond-human-ownership-confirmed]',
+      {
+        contactId: event.contactId,
+        attempts: assignmentRecheck.attempts,
+        assignee: getConversationAssignee(respondContactProfile),
+      },
+    )
+  }
+  const postBookingLockEnabled = isPostBookingLockEnabled()
+  const storedPostBookingLock = await getPostBookingLock(event.contactId, session.postBookingLock)
+  const postBookingLock = postBookingLockEnabled ? storedPostBookingLock : null
+
+  if (!postBookingLockEnabled && storedPostBookingLock) {
+    await expirePostBookingLock(event.contactId).catch((error) => {
+      console.warn(error.message)
+    })
+    await unassignRespondConversationAfterReply(event.contactId)
+    respondContactProfile = mergeRespondContactProfileFallbacks(
+      await getRespondContactProfile(event.contactId, null),
+      { phone: event.contactPhone },
+    )
+  }
+
+  if (isPostBookingLockActive(postBookingLock)) {
+    const currentAssignee = getConversationAssignee(respondContactProfile)
+    if (shouldRestorePostBookingAssignee({
+      lock: postBookingLock,
+      currentAssignee,
+      conversationClosed: isConversationClosed(respondContactProfile),
+      inboundMessage: true,
+    })) {
+      await assignRespondConversationToPostBookingHolder({
+        contactId: event.contactId,
+        assignee: postBookingLock.assignee,
+      }).catch((error) => {
+        console.warn(`Unable to restore Respond post-booking assignment: ${error.message}`)
+      })
+    }
+    setRespondSession(event.contactId, {
+      ...session,
+      postBookingLock,
+      respondContactProfile,
+      attribution,
+      ...getBotEngagementSessionFields(session, respondContactProfile),
+    })
+    console.log('[respond-post-booking-locked]', {
+      contactId: event.contactId,
+      lockedUntil: new Date(postBookingLock.lockedUntil).toISOString(),
+      assignee: postBookingLock.assignee,
+    })
+    return
+  }
+
+  if (isPostBookingLockExpired(postBookingLock)) {
+    await expirePostBookingLock(event.contactId).catch((error) => {
+      console.warn(error.message)
+    })
+    await unassignRespondConversationAfterReply(event.contactId)
+    removeRespondSession(event.contactId)
+    session = getRespondSession(event.contactId)
+    respondContactProfile = mergeRespondContactProfileFallbacks(
+      await getRespondContactProfile(event.contactId, null),
+      { phone: event.contactPhone },
+    )
+    console.log('[respond-post-booking-expired-restart]', {
+      contactId: event.contactId,
+      lockedUntil: new Date(postBookingLock.lockedUntil).toISOString(),
+    })
+  }
+
+  let humanTakeoverLock = await getHumanTakeoverLock(
+    event.contactId,
+    session.humanTakeoverLock,
+  )
+
+  if (
+    humanTakeoverLock?.phase === 'assigned' &&
+    !isConversationAssigned(respondContactProfile)
+  ) {
+    await expireHumanTakeoverLock(event.contactId, 'cancelled').catch((error) => {
+      console.warn(error.message)
+    })
+    humanTakeoverLock = null
+    console.log('[respond-human-takeover-manually-released]', {
+      contactId: event.contactId,
+    })
+  }
+
+  if (
+    humanTakeoverLock?.phase === 'assigned' &&
+    isConversationClosed(respondContactProfile)
+  ) {
+    humanTakeoverLock = closeHumanTakeoverLock(humanTakeoverLock)
+    await saveHumanTakeoverLock(humanTakeoverLock).catch((error) => {
+      console.warn(error.message)
+    })
+  }
+
+  if (isHumanTakeoverLockActive(humanTakeoverLock)) {
+    setRespondSession(event.contactId, {
+      ...session,
+      humanTakeoverLock,
+      respondContactProfile,
+      lastInteractionAt: Date.now(),
+    })
+    console.log('[respond-human-takeover-locked]', {
+      contactId: event.contactId,
+      assignee: humanTakeoverLock.assignee,
+      phase: humanTakeoverLock.phase,
+      lockedUntil: humanTakeoverLock.lockedUntil
+        ? new Date(humanTakeoverLock.lockedUntil).toISOString()
+        : '',
+    })
+    return
+  }
+
+  if (isHumanTakeoverLockExpired(humanTakeoverLock)) {
+    await expireHumanTakeoverLock(event.contactId).catch((error) => {
+      console.warn(error.message)
+    })
+    await unassignRespondConversationAfterReply(event.contactId)
+    removeRespondSession(event.contactId)
+    session = getRespondSession(event.contactId)
+    respondContactProfile = mergeRespondContactProfileFallbacks(
+      await getRespondContactProfile(event.contactId, null),
+      { phone: event.contactPhone },
+    )
+    console.log('[respond-human-takeover-expired-restart]', {
+      contactId: event.contactId,
+      lockedUntil: new Date(humanTakeoverLock.lockedUntil).toISOString(),
+    })
+  }
+
+  if (isConversationAssigned(respondContactProfile)) {
+    humanTakeoverLock = buildHumanTakeoverLock({
+      contactId: event.contactId,
+      assignee: getConversationAssignee(respondContactProfile),
+    })
+    await saveHumanTakeoverLock(humanTakeoverLock).catch((error) => {
+      console.warn(error.message)
+    })
+    setRespondSession(event.contactId, {
+      ...session,
+      humanTakeoverLock,
+      respondContactProfile,
+      lastInteractionAt: Date.now(),
+    })
+    console.log('[respond-human-takeover-detected]', {
+      contactId: event.contactId,
+      assignee: humanTakeoverLock?.assignee || '',
+    })
+    return
+  }
+
+  const automationDecision = getRespondAutomationDecision({
+    contactProfile: respondContactProfile,
+    session,
+    event,
+  })
+
+  if (automationDecision.action === 'skip_human_owned') {
+    const resumedProfile = await getRespondTransferResumeProfile({
+      contactId: event.contactId,
+      session,
+      initialDecision: automationDecision,
+    })
+
+    if (resumedProfile) {
+      respondContactProfile = mergeRespondContactProfileFallbacks(resumedProfile, {
+        phone: event.contactPhone,
+      })
+      clearRespondTransferSessionMarkers(event.contactId, session, respondContactProfile)
+      console.log('[respond-transfer-delayed-resume]', formatRespondAutomationDecisionLog(automationDecision))
+    } else {
+      const transferHandoffAt = automationDecision.lastHumanActivityAt || session.transferHandoffAt || Date.now()
+
+      setRespondSession(event.contactId, {
+        ...session,
+        transferHandoffAt,
+        lastInteractionAt: Date.now(),
+        respondContactProfile,
+      })
+      console.log('[respond-transfer-paused]', formatRespondAutomationDecisionLog(automationDecision))
+      return
+    }
+  }
+
+  if (automationDecision.action === 'allow_closed_restart') {
+    clearRespondTransferSessionMarkers(event.contactId, session, respondContactProfile)
+    console.log('[respond-transfer-restart]', formatRespondAutomationDecisionLog(automationDecision))
+    await unassignRespondConversationAfterReply(event.contactId)
+  }
+
+  if (automationDecision.action === 'allow_reopened_restart') {
+    clearRespondTransferSessionMarkers(event.contactId, session, respondContactProfile)
+    console.log('[respond-transfer-reopened-restart]', formatRespondAutomationDecisionLog(automationDecision))
+    await unassignRespondConversationAfterReply(event.contactId)
+  }
+
+  if (automationDecision.action === 'allow_unassigned_restart') {
+    clearRespondTransferSessionMarkers(event.contactId, session, respondContactProfile)
+    console.log('[respond-transfer-unassigned-restart]', formatRespondAutomationDecisionLog(automationDecision))
+  }
+
+  if (automationDecision.action === 'allow_idle_timeout') {
+    clearRespondTransferSessionMarkers(event.contactId, session, respondContactProfile)
+    console.log('[respond-transfer-idle-resume]', formatRespondAutomationDecisionLog(automationDecision))
+    await unassignRespondConversationAfterReply(event.contactId)
+  }
+
+  if (event.isVoiceMessage) {
+    const customerLanguage =
+      session.customerLanguage ||
+      respondContactProfile?.bookingDetails?.preferredLanguage ||
+      'Latin American Spanish'
+    const userMessage = {
+      role: 'user',
+      content: '[Customer sent a voice message]',
+    }
+
+    await transferRespondConversationToCustomerService({
+      contactId: event.contactId,
+      channelId: event.channelId,
+      customerLanguage,
+      session,
+      respondContactProfile,
+      transferTrigger: {
+        type: 'unsupported_voice_message',
+        reason: 'Customer sent an inbound voice or audio message.',
+      },
+      userMessage,
+    })
+    return
+  }
+
+  if (event.isImageMessage) {
+    const customerLanguage =
+      session.customerLanguage ||
+      respondContactProfile?.bookingDetails?.preferredLanguage ||
+      'Latin American Spanish'
+    const userMessage = {
+      role: 'user',
+      content: event.text || '[Customer sent an image]',
+    }
+
+    await transferRespondConversationToCustomerService({
+      contactId: event.contactId,
+      channelId: event.channelId,
+      customerLanguage,
+      session,
+      respondContactProfile,
+      transferTrigger: {
+        type: 'unsupported_image_message',
+        reason: 'Customer sent an inbound image that the automated assistant cannot review.',
+      },
+      userMessage,
+    })
+    return
+  }
+
+  if (event.isUnsupportedMessage) {
+    const customerLanguage =
+      session.customerLanguage ||
+      respondContactProfile?.bookingDetails?.preferredLanguage ||
+      'Latin American Spanish'
+    const userMessage = {
+      role: 'user',
+      content: '[Customer sent an unsupported message]',
+    }
+
+    await transferRespondConversationToCustomerService({
+      contactId: event.contactId,
+      channelId: event.channelId,
+      customerLanguage,
+      session,
+      respondContactProfile,
+      transferTrigger: {
+        type: 'unsupported_message',
+        reason: 'Respond delivered an inbound message type the automated assistant cannot process.',
+      },
+      userMessage,
+    })
+    return
+  }
+
+  const userMessage = {
+    role: 'user',
+    content: event.text,
+  }
+  const detectedLanguage = resolveCustomerLanguage({
+    messages: [userMessage],
+    message: event.text,
+  })
+  const preferredLanguage =
+    detectedLanguage ||
+    session.customerLanguage ||
+    respondContactProfile?.bookingDetails?.preferredLanguage ||
+    ''
+
+  if (
+    detectedLanguage &&
+    detectedLanguage !== respondContactProfile?.bookingDetails?.preferredLanguage
+  ) {
+    await updateRespondContactLanguage(event.contactId, detectedLanguage)
+    respondContactProfile = {
+      ...respondContactProfile,
+      bookingDetails: {
+        ...(respondContactProfile?.bookingDetails || {}),
+        preferredLanguage: detectedLanguage,
+      },
+    }
+  }
+  const transferTrigger = await resolveRespondTransferTrigger(event.text)
+
+  if (transferTrigger) {
+    await transferRespondConversationToCustomerService({
+      contactId: event.contactId,
+      channelId: event.channelId,
+      customerLanguage: preferredLanguage || 'Latin American Spanish',
+      session,
+      respondContactProfile,
+      transferTrigger,
+      userMessage,
+    })
+    return
+  }
+
+  if (shouldRestartRespondConversation(session)) {
+    const initialLanguage = preferredLanguage || 'Latin American Spanish'
+    const initialDetails = {
+      ...getRespondContactBookingDetails(respondContactProfile),
+      ...extractRespondBookingDetailsFromText(event.text),
+    }
+
+    if (await shouldPauseRespondReplyForHumanTakeover(event.contactId, session)) return
+
+    await sendInitialRespondSequence({
+      contactId: event.contactId,
+      customerLanguage: initialLanguage,
+      firstName: getCustomerFirstName(initialDetails, respondContactProfile),
+    })
+    await unassignRespondConversationAfterReply(event.contactId)
+
+    setRespondSession(event.contactId, {
+      channelId: event.channelId,
+      customerLanguage: initialLanguage,
+      languageAsked: false,
+      lastInteractionAt: Date.now(),
+      messages: [
+        userMessage,
+        {
+          role: 'agent',
+          content: getInitialGreeting(
+            initialLanguage,
+            getCustomerFirstName(initialDetails, respondContactProfile),
+          ),
+        },
+        { role: 'agent', content: getInitialStateQuestion(initialLanguage) },
+      ],
+      booking: {
+        bookingTeam: getBookingTeamForRespondContact(respondContactProfile),
+        details: initialDetails,
+        pendingField: 'state',
+      },
+      respondContactProfile,
+      attribution,
+    })
+    return
+  }
+
+  if (session.languageAsked && preferredLanguage) {
+    if (await shouldPauseRespondReplyForHumanTakeover(event.contactId, session)) return
+
+    await sendInitialRespondSequence({
+      contactId: event.contactId,
+      customerLanguage: preferredLanguage,
+      firstName: getCustomerFirstName(getRespondContactBookingDetails(respondContactProfile), respondContactProfile),
+    })
+    await unassignRespondConversationAfterReply(event.contactId)
+
+    setRespondSession(event.contactId, {
+      channelId: event.channelId,
+      customerLanguage: preferredLanguage,
+      languageAsked: false,
+      lastInteractionAt: Date.now(),
+      messages: [
+        ...session.messages,
+        userMessage,
+        {
+          role: 'agent',
+          content: getInitialGreeting(
+            preferredLanguage,
+            getCustomerFirstName(getRespondContactBookingDetails(respondContactProfile), respondContactProfile),
+          ),
+        },
+        { role: 'agent', content: getInitialStateQuestion(preferredLanguage) },
+      ].slice(-12),
+      booking: {
+        bookingTeam: getBookingTeamForRespondContact(respondContactProfile),
+        details: getRespondContactBookingDetails(respondContactProfile),
+        pendingField: 'state',
+      },
+      respondContactProfile,
+      attribution,
+    })
+    return
+  }
+
+  const messages = [...session.messages, userMessage].slice(-12)
+  const customerLanguage = preferredLanguage || 'Latin American Spanish'
+  const state = extractStateName(event.text)
+  console.log('[respond-message-classification]', {
+    contactId: event.contactId,
+    language: customerLanguage,
+    state,
+    acquisitionIntent: isTreatmentAcquisitionQuestion(event.text),
+    privacyIntent: isClientTreatmentPrivacyQuestion(event.text),
+  })
+  const activeBooking = refreshRespondBookingTeam(
+    getActiveRespondBookingForMessage(session.booking, state),
+    respondContactProfile,
+  )
+
+  if (state) {
+    await updateRespondContactState(event.contactId, state)
+    await recordBookingFunnelEvent({
+      contactId: event.contactId,
+      eventType: 'state_received',
+      metadata: { state, stageKey: state },
+    }).catch((error) => console.warn(error.message))
+  }
+
+  const bookingResponse = await handleRespondBookingAutomation({
+    session: { ...session, booking: activeBooking },
+    messages,
+    customerLanguage,
+    respondContactProfile,
+  })
+
+  if (bookingResponse) {
+    if (bookingResponse.frontDeskTransfer?.type === 'state_location_clarification') {
+      await transferRespondConversationToCustomerService({
+        contactId: event.contactId,
+        channelId: event.channelId,
+        customerLanguage,
+        session: { ...session, booking: bookingResponse.booking },
+        respondContactProfile,
+        transferTrigger: bookingResponse.frontDeskTransfer,
+        userMessage,
+      })
+      return
+    }
+
+    bookingResponse.text = enforceReplyLanguage({
+      text: bookingResponse.text,
+      customerLanguage,
+      latestUserText: event.text,
+    })
+    const postReplyMessages = []
+    let nextPostBookingLock = session.postBookingLock || null
+
+    if (await shouldPauseRespondReplyForHumanTakeover(event.contactId, session)) return
+
+    if (bookingResponse.postReplyRespondAction?.type === 'booked') {
+      const bookedAction = bookingResponse.postReplyRespondAction
+      const postBookingAssignment = isPostBookingLockEnabled()
+        ? getRespondAssigneeForBookedSpecialist(bookedAction.booked, bookedAction.option)
+        : { assignee: '' }
+
+      // Persist the lock as soon as HubSpot confirms the meeting. Respond
+      // assignment is recoverable: an active lock will retry/restore the
+      // booked specialist on conversation-state events and inbound messages.
+      // Do not leave the contact unlocked merely because the first assignment
+      // request fails after the customer has already been told they are booked.
+      nextPostBookingLock = buildPostBookingLock({
+        contactId: event.contactId,
+        assignee: postBookingAssignment.assignee,
+        booked: bookedAction.booked,
+        option: bookedAction.option,
+      })
+      await savePostBookingLock(nextPostBookingLock).catch((error) => {
+        console.warn(error.message)
+      })
+      if (nextPostBookingLock && !postBookingAssignment.assignee) {
+        console.warn(
+          `Post-booking automation is locked for contact ${event.contactId}, but no Respond assignee is mapped for the booked specialist.`,
+        )
+      }
+
+      const statusUpdate = await updateRespondContactStatusAfterBooking(event.contactId)
+      await recordBookingReportEvent({
+        contactId: event.contactId,
+        contactPhone: respondContactProfile?.bookingDetails?.phone || event.contactPhone,
+        attribution,
+        booked: bookingResponse.postReplyRespondAction.booked,
+        option: bookingResponse.postReplyRespondAction.option,
+      }).catch(async (error) => {
+        console.warn(error.message)
+        await recordBookingFailureEvent({
+          contactId: event.contactId,
+          failureType: 'tracking_write_failed',
+          phase: 'booking_attribution',
+          option: bookingResponse.postReplyRespondAction.option,
+          booking: { bookingTeam: bookingResponse.postReplyRespondAction.option?.bookingTeam },
+          error,
+        }).catch((recordError) => console.warn(recordError.message))
+      })
+      await sendBookingConfirmationVideo({
+        contactId: event.contactId,
+        channelId: event.channelId,
+      })
+      await sendRespondTextMessage({
+        contactId: event.contactId,
+        channelId: event.channelId,
+        text: bookingResponse.text,
+      })
+      const paymentInfoText = buildBookingPaymentInfoMessage(customerLanguage)
+
+      await sendRespondTextMessage({
+        contactId: event.contactId,
+        channelId: event.channelId,
+        text: paymentInfoText,
+      })
+      postReplyMessages.push({ role: 'agent', content: paymentInfoText })
+      const assignment = isPostBookingLockEnabled()
+        ? await assignRespondConversationAfterBooking({
+          contactId: event.contactId,
+          booked: bookingResponse.postReplyRespondAction.booked,
+          option: bookingResponse.postReplyRespondAction.option,
+        }).catch((error) => {
+          console.warn(`Unable to assign Respond conversation after booking: ${error.message}`)
+          return null
+        })
+        : null
+
+      if (!isPostBookingLockEnabled()) {
+        await unassignRespondConversationAfterReply(event.contactId)
+      }
+
+      if (!assignment?.assigned && nextPostBookingLock) {
+        console.warn(
+          `Respond assignment failed after booking; post-booking lock remains active for contact ${event.contactId} and restoration will be retried.`,
+        )
+      }
+      if (statusUpdate?.ok === false || (isPostBookingLockEnabled() && !assignment?.assigned)) {
+        const retryOption = bookingResponse.postReplyRespondAction.option
+        await enqueueBookingReconciliation({
+          attemptKey: buildBookingAttemptKey(event.contactId, retryOption),
+          contactId: event.contactId,
+          payload: {
+            customer: bookingResponse.postReplyRespondAction.customer,
+            option: retryOption,
+            bookingTeam: resolveBookingTeamForOption(retryOption),
+          },
+        }).catch((error) => console.warn(error.message))
+      }
+    } else {
+      await sendRespondTextMessage({
+        contactId: event.contactId,
+        channelId: event.channelId,
+        text: bookingResponse.text,
+      })
+      await unassignRespondConversationAfterReply(event.contactId)
+    }
+
+    const nextSession = setRespondSession(event.contactId, {
+      customerLanguage,
+      languageAsked: false,
+      lastInteractionAt: Date.now(),
+      messages: [
+        ...messages,
+        { role: 'agent', content: bookingResponse.text },
+        ...postReplyMessages,
+      ].slice(-12),
+      booking: bookingResponse.booking,
+      postBookingLock: nextPostBookingLock,
+      respondContactProfile,
+      attribution,
+    })
+    scheduleExistingClientNoResponseHandoff(event.contactId, nextSession)
+    return
+  }
+
+  const ragContext = await buildRagContext({
+    agent: RESPOND_AGENT,
+    messages,
+    message: event.text,
+  })
+  const memoryContext = await buildMemoryContext({
+    agent: RESPOND_AGENT,
+    messages,
+    message: event.text,
+  })
+  const redundancyControl = buildRedundancyControl({ messages })
+  const instructions = buildInstructions({
+    agent: RESPOND_AGENT,
+    customerLanguage,
+    redundancyControl,
+  })
+  const input = buildInput({
+    messages,
+    customerLanguage,
+    redundancyControl,
+    context: [memoryContext, ragContext].filter(Boolean).join('\n\n'),
+    respondContactProfile,
+    booking: activeBooking,
+  })
+  const generatedText = await createOpenAIResponseText({
+    model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+    instructions,
+    input,
+  })
+  const text = enforceReplyLanguage({
+    text: preventUnconfirmedBookingReply(generatedText, customerLanguage, messages, session),
+    customerLanguage,
+    latestUserText: event.text,
+  })
+
+  if (await shouldPauseRespondReplyForHumanTakeover(event.contactId, session)) return
+
+  await sendRespondTextMessage({
+    contactId: event.contactId,
+    channelId: event.channelId,
+    text,
+  })
+  await unassignRespondConversationAfterReply(event.contactId)
+
+  setRespondSession(event.contactId, {
+    customerLanguage,
+    languageAsked: false,
+    lastInteractionAt: Date.now(),
+    messages: [...messages, { role: 'agent', content: text }].slice(-12),
+    booking: activeBooking || null,
+    respondContactProfile,
+    attribution,
+    ...getBotEngagementSessionFields(session, respondContactProfile),
+  })
+
+  queueMemorySuggestion({
+    agentId: RESPOND_AGENT.id,
+    messages,
+    agentReply: text,
+    source: 'respond_webhook',
+    metadata: {
+      channel_id: event.channelId,
+    },
+  })
+}
+
+function getActiveRespondBookingForMessage(booking, latestState) {
+  if (!booking || booking.pendingField !== 'state' || latestState) {
+    return booking || null
+  }
+
+  return {
+    ...booking,
+    details: {
+      ...(booking.details || {}),
+      state: '',
+    },
+  }
+}
+
+function refreshRespondBookingTeam(booking, profile) {
+  if (!booking) {
+    return null
+  }
+
+  const bookingTeam = getCurrentRespondBookingTeam(booking, profile)
+  logRespondRoutingDecision('refresh-booking-team', {
+    contactStatus: profile?.fields?.contactStatus,
+    profileStatus: profile?.status,
+    previousBookingTeam: booking.bookingTeam,
+    bookingTeam,
+  })
+
+  const hasStaleNewClientNameStep =
+    bookingTeam === 'customer_service' && booking.pendingField === 'name'
+
+  if (bookingTeam === booking.bookingTeam && !hasStaleNewClientNameStep) {
+    return booking
+  }
+
+  return {
+    ...booking,
+    bookingTeam,
+    pendingField: hasStaleNewClientNameStep ? '' : booking.pendingField,
+    teamChanged: bookingTeam !== booking.bookingTeam,
+  }
+}
+
+async function unassignRespondConversationAfterReply(contactId) {
+  await unassignRespondConversation(contactId).catch((error) => {
+    console.warn(`Unable to unassign Respond conversation: ${error.message}`)
+  })
+}
+
+async function shouldPauseRespondReplyForHumanTakeover(contactId, session = {}) {
+  const lock = await getHumanTakeoverLock(contactId, session.humanTakeoverLock)
+  if (isHumanTakeoverLockActive(lock)) {
+    console.log('[respond-human-takeover-pre-send-paused]', {
+      contactId,
+      assignee: lock.assignee,
+      phase: lock.phase,
+    })
+    return true
+  }
+
+  const profile = await getRespondContactProfile(contactId, session.respondContactProfile)
+  if (!isConversationAssigned(profile)) return false
+
+  const detectedLock = buildHumanTakeoverLock({
+    contactId,
+    assignee: getConversationAssignee(profile),
+  })
+  await saveHumanTakeoverLock(detectedLock).catch((error) => console.warn(error.message))
+  setRespondSession(contactId, {
+    ...session,
+    humanTakeoverLock: detectedLock,
+    respondContactProfile: profile,
+    lastInteractionAt: Date.now(),
+  })
+  console.log('[respond-human-takeover-pre-send-detected]', {
+    contactId,
+    assignee: detectedLock?.assignee || '',
+  })
+  return true
+}
+
+async function getRespondTransferResumeProfile({ contactId, session = {}, initialDecision = {} } = {}) {
+  const delayMs = Number(process.env.RESPOND_TRANSFER_RECHECK_DELAY_MS || 2500)
+
+  if (!contactId || delayMs <= 0) {
+    return null
+  }
+
+  await delay(delayMs)
+
+  const profile = await getRespondContactProfile(contactId, session.respondContactProfile)
+  const decision = getRespondAutomationDecision({
+    contactProfile: profile,
+    session,
+    event: { contactId },
+  })
+
+  if (decision.action === 'allow_unassigned_restart' || decision.action === 'allow_reopened_restart') {
+    console.log('[respond-transfer-recheck-resume]', {
+      contactId,
+      initialAction: initialDecision.action,
+      action: decision.action,
+      assignee: decision.assignee,
+      reason: decision.reason,
+    })
+    return profile
+  }
+
+  console.log('[respond-transfer-recheck-still-paused]', {
+    contactId,
+    initialAction: initialDecision.action,
+    action: decision.action,
+    assignee: decision.assignee,
+    reason: decision.reason,
+  })
+
+  return null
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms)
+  })
+}
+
+async function transferRespondConversationToCustomerService({
+  contactId,
+  channelId,
+  customerLanguage,
+  session = {},
+  respondContactProfile = null,
+  transferTrigger,
+  userMessage,
+}) {
+  const frontDeskAssignees = getRespondFrontDeskAssignees()
+  let assignee = ''
+  let assigned = false
+
+  if (!frontDeskAssignees.length) {
+    console.warn(
+      `Unable to transfer Respond conversation to Customer Service: no configured Front Desk team member has a Respond assignee in RESPOND_BOOKING_ASSIGNEES.`,
+    )
+  } else {
+    for (const candidate of shuffleItems(frontDeskAssignees)) {
+      try {
+        await assignRespondConversation({ contactId, assignee: candidate })
+        assignee = candidate
+        assigned = true
+        break
+      } catch (error) {
+        console.warn(`Unable to transfer Respond conversation to Front Desk assignee ${candidate}: ${error.message}`)
+      }
+    }
+  }
+
+  const text = assigned
+    ? await resolveRespondTransferMessage({
+      customerLanguage,
+      latestUserText: userMessage?.content || '',
+      transferTrigger,
+    })
+    : buildRespondTransferFailureMessage(customerLanguage)
+
+  await sendRespondTextMessage({ contactId, channelId, text })
+
+  setRespondSession(contactId, {
+    ...session,
+    customerLanguage,
+    languageAsked: false,
+    lastInteractionAt: Date.now(),
+    transferHandoffAt: assigned ? Date.now() : null,
+    transferClosedAt: null,
+    messages: [
+      ...(session.messages || []),
+      userMessage,
+      { role: 'agent', content: text },
+    ].slice(-12),
+    booking: session.booking || null,
+    respondContactProfile,
+  })
+
+  console.log(
+    '[respond-transfer-front-desk]',
+    Object.fromEntries(
+      Object.entries({
+        contactId,
+        assignee,
+        triggerType: transferTrigger?.type,
+        reason: transferTrigger?.reason,
+      }).filter(([, value]) => Boolean(value)),
+    ),
+  )
+}
+
+function getRespondFrontDeskAssignees() {
+  const assignees = parseRespondAssigneeMap(process.env.RESPOND_BOOKING_ASSIGNEES)
+  const frontDeskAssignees = getConfiguredFrontDeskTeam()
+    .flatMap((member) => [
+      member.slug,
+      member.name,
+      member.fieldValue,
+    ])
+    .map((value) => assignees[normalizeRespondAssigneeKey(value)])
+    .filter(Boolean)
+  const uniqueAssignees = [...new Set(frontDeskAssignees)]
+
+  return uniqueAssignees
+}
+
+function getRespondCustomerServiceAssignees() {
+  const assignees = parseRespondAssigneeMap(process.env.RESPOND_BOOKING_ASSIGNEES)
+  return [...new Set(
+    getConfiguredCustomerServiceTeam()
+      .flatMap((member) => [member.slug, member.name, member.fieldValue])
+      .map((value) => assignees[normalizeRespondAssigneeKey(value)])
+      .filter(Boolean),
+  )]
+}
+
+function cancelExistingClientNoResponseHandoff(contactId) {
+  const timer = existingClientNoResponseTimers.get(contactId)
+  if (timer) clearTimeout(timer)
+  existingClientNoResponseTimers.delete(contactId)
+}
+
+function scheduleExistingClientNoResponseHandoff(contactId, session = {}) {
+  cancelExistingClientNoResponseHandoff(contactId)
+
+  if (
+    session.respondContactProfile?.status !== 'returning_client' ||
+    session.postBookingLock ||
+    !Number.isFinite(EXISTING_CLIENT_NO_RESPONSE_MS) ||
+    EXISTING_CLIENT_NO_RESPONSE_MS < 0
+  ) return
+
+  const dueAt = Date.now() + EXISTING_CLIENT_NO_RESPONSE_MS
+  const nextSession = { ...session, existingClientNoResponseDueAt: dueAt }
+  setRespondSession(contactId, nextSession)
+
+  const timer = setTimeout(() => {
+    existingClientNoResponseTimers.delete(contactId)
+    finalizeExistingClientNoResponseHandoff(contactId).catch((error) => {
+      console.warn(`Unable to complete existing-client no-response handoff: ${error.message}`)
+    })
+  }, EXISTING_CLIENT_NO_RESPONSE_MS)
+  timer.unref?.()
+  existingClientNoResponseTimers.set(contactId, timer)
+
+  console.log('[respond-existing-client-no-response-scheduled]', {
+    contactId,
+    dueAt: new Date(dueAt).toISOString(),
+  })
+}
+
+async function finalizeExistingClientNoResponseHandoff(contactId) {
+  const session = getRespondSession(contactId)
+  const dueAt = Number(session.existingClientNoResponseDueAt)
+  if (!dueAt || dueAt > Date.now()) return false
+
+  const profile = await getRespondContactProfile(contactId, session.respondContactProfile)
+  const currentSession = getRespondSession(contactId)
+  if (
+    Number(currentSession.existingClientNoResponseDueAt) !== dueAt ||
+    profile?.status !== 'returning_client'
+  ) return false
+
+  let assignee = ''
+  for (const candidate of shuffleItems(getRespondCustomerServiceAssignees())) {
+    try {
+      await assignRespondConversation({ contactId, assignee: candidate })
+      assignee = candidate
+      break
+    } catch (error) {
+      console.warn(`Unable to assign silent existing client to Customer Service ${candidate}: ${error.message}`)
+    }
+  }
+
+  if (!assignee) {
+    throw new Error('No configured Customer Service assignee accepted the conversation.')
+  }
+
+  const lockMs = Number.isFinite(EXISTING_CLIENT_AUTOMATION_LOCK_MS) && EXISTING_CLIENT_AUTOMATION_LOCK_MS >= 0
+    ? EXISTING_CLIENT_AUTOMATION_LOCK_MS
+    : 24 * 60 * 60 * 1000
+  const lockedUntil = Date.now() + lockMs
+  setRespondSession(contactId, {
+    ...currentSession,
+    respondContactProfile: profile,
+    existingClientNoResponseDueAt: null,
+    existingClientAutomationLockedUntil: lockedUntil,
+    existingClientNoResponseAssignee: assignee,
+    lastInteractionAt: Date.now(),
+  })
+  console.log('[respond-existing-client-no-response-handoff]', {
+    contactId,
+    assignee,
+    lockedUntil: new Date(lockedUntil).toISOString(),
+  })
+  return true
+}
+
+function shuffleItems(items = []) {
+  return [...items].sort(() => Math.random() - 0.5)
+}
+
+function pickRandomItem(items = []) {
+  if (!items.length) {
+    return ''
+  }
+
+  return items[Math.floor(Math.random() * items.length)]
+}
+
+async function resolveRespondTransferMessage({ customerLanguage, latestUserText, transferTrigger }) {
+  if (isFixedTransferMessageLanguage(customerLanguage) || !process.env.OPENAI_API_KEY) {
+    return buildRespondTransferMessage({ customerLanguage, trigger: transferTrigger })
+  }
+
+  try {
+    return await createOpenAIResponseText({
+      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+      instructions: [
+        'Write one short customer-facing handoff message in the same language as the customer message.',
+        'Return only the message text. Do not include JSON, labels, notes, or quotation marks.',
+        'Use a kind, calm tone with one warm emoji at the start and one prayer/thanks emoji at the end.',
+        transferTrigger?.type === 'unsupported_image_message'
+          ? 'The customer sent an image, which the automated assistant does not process. Say you received the image and are transferring them to Front Desk for assistance. Do not describe or make assumptions about the image.'
+          : transferTrigger?.type === 'unsupported_voice_message'
+          ? 'The customer sent a voice message, which the automated assistant does not process. Say you are transferring them to Customer Service for assistance. Do not claim the message was unclear and do not imply frustration.'
+          : transferTrigger?.type === 'unsupported_message'
+          ? 'Respond delivered a message type the automated assistant cannot process. Say it was received and that you are transferring them to Front Desk. Do not imply frustration or blame the customer.'
+          : transferTrigger?.type === 'unrecognized_message'
+          ? 'The automated assistant could not confidently understand the message. Say you are transferring them to Front Desk for personal assistance. Do not imply frustration or blame the customer.'
+          : transferTrigger?.type === 'state_location_clarification'
+          ? 'The automated assistant could not confidently understand the customer state after one clarification. Say the Front Desk team will help confirm their location and continue assisting. Do not imply the customer is frustrated or did anything wrong.'
+          : transferTrigger?.type === 'transfer_request'
+          ? 'The customer explicitly asked to be transferred. Say we can connect them now and that Customer Service will help in more detail.'
+          : 'The customer is frustrated or asking for a refund/escalation. Say you understand their frustration, are sorry for the situation, and will escalate the case to Customer Service specialists who handle cases like this.',
+        'Do not continue booking, do not ask for state/phone/name, and do not promise a refund or resolution.',
+      ].join('\n'),
+      input: `Customer message:\n${latestUserText}`,
+    })
+  } catch (error) {
+    console.warn(`Unable to localize Respond transfer message with model: ${error.message}`)
+    return buildRespondTransferMessage({ customerLanguage, trigger: transferTrigger })
+  }
+}
+
+function isFixedTransferMessageLanguage(customerLanguage) {
+  const language = String(customerLanguage || '').toLowerCase()
+
+  return (
+    language.includes('english') ||
+    language.includes('spanish') ||
+    language.includes('portuguese') ||
+    /\b(en|es|pt)\b/.test(language)
+  )
+}
+
+async function resolveRespondTransferTrigger(text) {
+  // Doctor/provider questions belong in the booking flow and must be answered
+  // with the approved provider-network script, never routed to Customer Service.
+  if (isDoctorOrProviderQuestion(text)) {
+    return null
+  }
+
+  if (isGeneralProductOrMedicationClarification(text)) {
+    return null
+  }
+
+  const keywordTrigger = detectRespondTransferTrigger(text)
+
+  if (keywordTrigger || !process.env.OPENAI_API_KEY) {
+    return keywordTrigger
+  }
+
+  try {
+    const result = await createOpenAIResponseText({
+      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+      instructions: [
+        'Classify whether a customer support/sales chat message requires immediate transfer to Customer Service.',
+        'Return only compact JSON with keys: shouldTransfer boolean, type string, reason string.',
+        'Transfer if the customer is irate, angry, threatening legal/report/chargeback action, strongly complaining, asking for a manager/human/customer service/support/specialist, or explicitly requesting transfer/escalation.',
+        'Transfer if the customer asks for a refund while expressing fraud/scam/frustration language, including Spanglish such as "quiero mi refund" or Spanish accusations such as "estafadores".',
+        'Transfer with type "unrecognized_message" when the message is genuinely unintelligible, corrupted, or has no interpretable meaning. Do not use this for misspellings, short booking answers, names, locations, another language, or mild ambiguity.',
+        'Classify messages in any language. Do not transfer for normal product questions, normal booking answers, or mild confusion.',
+        'A question about speaking with a doctor, physician, medical provider, or licensed provider is a normal booking question. Never transfer it to Customer Service; it must remain in the booking flow.',
+        'A customer clarifying that they want general medication, treatment, product, or offering information is not complaining and is not requesting a human. Never transfer that clarification to Customer Service.',
+      ].join('\n'),
+      input: `Customer message:\n${text}`,
+    })
+    const parsed = JSON.parse(result)
+
+    if (parsed?.shouldTransfer === true) {
+      return {
+        type: parsed.type === 'transfer_request'
+          ? 'transfer_request'
+          : parsed.type === 'unrecognized_message'
+            ? 'unrecognized_message'
+            : 'irate_customer',
+        reason: String(parsed.reason || 'Model classified this message as requiring Customer Service transfer.'),
+      }
+    }
+  } catch (error) {
+    console.warn(`Unable to classify Respond transfer trigger with model: ${error.message}`)
+  }
+
+  return null
+}
+
+function clearRespondTransferSessionMarkers(contactId, session = {}, respondContactProfile = null) {
+  const nextSession = {
+    ...session,
+    respondContactProfile,
+  }
+
+  delete nextSession.transferHandoffAt
+  delete nextSession.handoffAt
+  delete nextSession.transferClosedAt
+
+  setRespondSession(contactId, nextSession)
+}
+
+function formatRespondAutomationDecisionLog(decision = {}) {
+  return Object.fromEntries(
+    Object.entries({
+      contactId: decision.contactId,
+      action: decision.action,
+      assignee: decision.assignee,
+      closed: decision.closed,
+      idleHours: decision.idleHours,
+      lastHumanActivityAt: decision.lastHumanActivityAt
+        ? new Date(decision.lastHumanActivityAt).toISOString()
+        : '',
+      conversationOpenedAt: decision.conversationOpenedAt
+        ? new Date(decision.conversationOpenedAt).toISOString()
+        : '',
+      reason: decision.reason,
+    }).filter(([, value]) => value !== undefined && value !== ''),
+  )
+}
+
+async function assignRespondConversationAfterBooking({ contactId, booked, option }) {
+  const assignment = getRespondAssigneeForBookedSpecialist(booked, option)
+  const assignee = assignment.assignee
+
+  if (!assignee) {
+    console.warn(
+      `Unable to assign Respond conversation: no assignee configured for booked specialist ${booked?.sellerSlug || option?.sellerSlug || booked?.sellerName || option?.sellerName || 'unknown'}. Tried keys: ${assignment.keys.join(', ') || 'none'}. Configured keys: ${assignment.configuredKeys.join(', ') || 'none'}.`,
+    )
+    return { assigned: false, assignee: '' }
+  }
+
+  await assignRespondConversationToPostBookingHolder({ contactId, assignee })
+
+  console.log('[respond-booking-assigned]', {
+    contactId,
+    assignee,
+    bookedSpecialist: booked?.sellerSlug || option?.sellerSlug || booked?.sellerName || option?.sellerName,
+  })
+
+  return { assigned: true, assignee }
+}
+
+async function assignRespondConversationToPostBookingHolder({ contactId, assignee }) {
+  pendingPostBookingAssignments.set(contactId, Date.now() + 60 * 1000)
+  setTimeout(() => {
+    if (Number(pendingPostBookingAssignments.get(contactId)) <= Date.now()) {
+      pendingPostBookingAssignments.delete(contactId)
+    }
+  }, 60 * 1000)
+
+  try {
+    await assignRespondConversation({ contactId, assignee })
+  } catch (error) {
+    pendingPostBookingAssignments.delete(contactId)
+    throw error
+  }
+
+  console.log('[respond-post-booking-assignment-restored]', { contactId, assignee })
+}
+
+function buildRespondTransferFailureMessage(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+  if (language === 'Latin American Spanish') {
+    return 'No pude completar la transferencia en este momento. Nuestro equipo puede continuar ayudandote aqui cuando haya un agente disponible.'
+  }
+  if (language === 'Portuguese') {
+    return 'Nao consegui concluir a transferencia neste momento. Nossa equipe pode continuar ajudando por aqui quando um agente estiver disponivel.'
+  }
+  return 'I could not complete the transfer right now. Our team can continue helping here when an agent is available.'
+}
+
+function getRespondAssigneeForBookedSpecialist(booked = {}, option = {}) {
+  const assignees = parseRespondAssigneeMap(process.env.RESPOND_BOOKING_ASSIGNEES)
+  const specialistKeys = [
+    booked.sellerSlug,
+    option.sellerSlug,
+    booked.sellerFieldValue,
+    option.sellerFieldValue,
+    booked.sellerName,
+    option.sellerName,
+  ]
+    .map((value) => normalizeRespondAssigneeKey(value))
+    .filter(Boolean)
+  const keys = [...new Set(specialistKeys.flatMap(getRespondSpecialistAssigneeAliases))]
+
+  return {
+    assignee: keys.map((key) => assignees[key]).find(Boolean) || '',
+    keys,
+    configuredKeys: Object.keys(assignees),
+  }
+}
+
+function getRespondSpecialistAssigneeAliases(key) {
+  // Aline Strelow in HubSpot/Aircall is the same person as Alice F in Respond.
+  if (key === 'aline' || key === 'aline-strelow') {
+    return [key, 'alice-f', 'alice']
+  }
+
+  return [key]
+}
+
+function parseRespondAssigneeMap(value) {
+  const text = String(value || '').trim()
+
+  if (!text) {
+    return {}
+  }
+
+  try {
+    const parsed = JSON.parse(text)
+
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.fromEntries(
+        Object.entries(parsed)
+          .map(([key, assignee]) => [normalizeRespondAssigneeKey(key), String(assignee || '').trim()])
+          .filter(([key, assignee]) => key && assignee),
+      )
+    }
+  } catch {
+    // Allow a compact env format like "alice-f=alice@example.com,arles-martinez=arles@example.com".
+  }
+
+  return Object.fromEntries(
+    text
+      .split(',')
+      .map((item) => item.split('='))
+      .map(([key, assignee]) => [normalizeRespondAssigneeKey(key), String(assignee || '').trim()])
+      .filter(([key, assignee]) => key && assignee),
+  )
+}
+
+function normalizeRespondAssigneeKey(value) {
+  return normalizeSearchText(value).replace(/\s+/g, '-')
+}
+
+function logRespondRoutingDecision(stage, details = {}) {
+  console.log(
+    '[respond-routing]',
+    stage,
+    Object.fromEntries(
+      Object.entries(details).filter(([, value]) => value !== undefined && value !== ''),
+    ),
+  )
+}
+
+function getRespondSession(contactId) {
+  return respondSessions.get(contactId) || {
+    customerLanguage: '',
+    languageAsked: false,
+    lastInteractionAt: 0,
+    messages: [],
+    booking: null,
+    respondContactProfile: null,
+  }
+}
+
+async function hydrateRespondSession(contactId) {
+  if (respondSessions.has(contactId)) return respondSessions.get(contactId)
+
+  const storedSession = await loadRespondSession(contactId, null)
+  if (storedSession) respondSessions.set(contactId, storedSession)
+  return storedSession
+}
+
+async function refreshRespondSession(contactId) {
+  const storedSession = await loadRespondSession(contactId, null)
+  if (storedSession) respondSessions.set(contactId, storedSession)
+  else respondSessions.delete(contactId)
+  return storedSession
+}
+
+async function waitForRespondSessionPersistence(contactId) {
+  await (respondSessionPersistenceQueues.get(contactId) || Promise.resolve())
+}
+
+function setRespondSession(contactId, session) {
+  respondSessions.set(contactId, session)
+  queueRespondSessionPersistence(contactId, () => saveRespondSession(contactId, session))
+  return session
+}
+
+function removeRespondSession(contactId) {
+  const existed = respondSessions.delete(contactId)
+  queueRespondSessionPersistence(contactId, () => deleteStoredRespondSession(contactId))
+  return existed
+}
+
+function queueRespondSessionPersistence(contactId, operation) {
+  const previous = respondSessionPersistenceQueues.get(contactId) || Promise.resolve()
+  const current = previous.catch(() => {}).then(operation)
+  const settled = current
+    .catch((error) => console.warn(error.message))
+    .finally(() => {
+      if (respondSessionPersistenceQueues.get(contactId) === settled) {
+        respondSessionPersistenceQueues.delete(contactId)
+      }
+    })
+
+  respondSessionPersistenceQueues.set(contactId, settled)
+  return settled
+}
+
+async function getRespondContactProfile(contactId, fallbackProfile = null) {
+  try {
+    const contact = await getRespondContact(contactId)
+    return classifyRespondContact(contact)
+  } catch (error) {
+    console.warn(`Unable to fetch Respond contact profile: ${error.message}`)
+    return fallbackProfile || classifyRespondContact(null)
+  }
+}
+
+function classifyRespondContact(contact) {
+  const conversation = buildRespondConversationSummary(contact)
+
+  if (!contact?.id) {
+    return {
+      status: 'new_or_no_record',
+      label: 'New or no existing Respond record',
+      reason: 'Respond contact lookup did not return a profile.',
+      bookingDetails: {},
+      conversation,
+    }
+  }
+
+  const customFields = getRespondCustomFieldMap(contact)
+  const tags = getRespondTagNames(contact)
+  const bookingDetails = buildRespondContactBookingDetails({ contact, customFields })
+  const leadStatus = customFields.lead_status || ''
+  const leadSource = getRespondLeadSource(customFields)
+  const classification = customFields.classification || ''
+  const contactStatus = getRespondContactStatus(customFields, contact)
+  const hubspotId = customFields.hubspot_id || ''
+  const statusText = [
+    contactStatus,
+    leadStatus,
+    classification,
+    contact.lifecycle,
+    contact.status,
+    tags.join(' '),
+  ]
+    .filter(Boolean)
+    .join(' ')
+
+  if (/\b(client|cliente|patient|paciente|active|paid|current|recurring|old client)\b/i.test(statusText)) {
+    return {
+      status: 'returning_client',
+      exactContactStatus: contactStatus,
+      label: 'Returning client',
+      reason: 'Respond fields or tags indicate an existing client/patient.',
+      fields: buildRespondContactSignalSummary({ customFields, tags, contact }),
+      bookingDetails,
+      conversation,
+      leadSource,
+    }
+  }
+
+  if (/\b(evaluation scheduled|scheduled|booked|appointment|cita|1st evaluation)\b/i.test(statusText)) {
+    return {
+      status: 'returning_lead',
+      exactContactStatus: contactStatus,
+      label: 'Returning lead',
+      reason: 'Respond fields or tags indicate an existing scheduled/evaluated lead.',
+      fields: buildRespondContactSignalSummary({ customFields, tags, contact }),
+      bookingDetails,
+      conversation,
+      leadSource,
+    }
+  }
+
+  if (hubspotId) {
+    return {
+      status: 'existing_hubspot_contact',
+      exactContactStatus: contactStatus,
+      label: 'Existing HubSpot contact',
+      reason: 'Respond contact has a hubspot_id custom field.',
+      fields: buildRespondContactSignalSummary({ customFields, tags, contact }),
+      bookingDetails,
+      conversation,
+      leadSource,
+    }
+  }
+
+  if (/\b(no response|closed|follow up|follow-up|followup)\b/i.test(statusText)) {
+    return {
+      status: 'returning_conversation',
+      exactContactStatus: contactStatus,
+      label: 'Returning conversation',
+      reason: 'Respond fields indicate prior conversation handling, but not confirmed client status.',
+      fields: buildRespondContactSignalSummary({ customFields, tags, contact }),
+      bookingDetails,
+      conversation,
+      leadSource,
+    }
+  }
+
+  return {
+    status: 'new_or_no_record',
+    exactContactStatus: contactStatus,
+    label: 'New or no existing record',
+    reason: 'No current Respond fields indicate a prior client, lead, HubSpot record, or handled conversation.',
+    fields: buildRespondContactSignalSummary({ customFields, tags, contact }),
+    bookingDetails,
+    conversation,
+    leadSource,
+  }
+}
+
+function getRespondLeadSource(customFields = {}) {
+  return String(
+    customFields.lead_source ||
+    customFields.leadsource ||
+    customFields['Lead Source'] ||
+    '',
+  ).trim()
+}
+
+function buildRespondConversationSummary(contact = {}) {
+  const conversation =
+    contact?.conversation ||
+    contact?.conversationInfo ||
+    contact?.conversation_info ||
+    contact?.currentConversation ||
+    contact?.current_conversation ||
+    {}
+
+  return Object.fromEntries(
+    Object.entries({
+      status:
+        conversation.status ||
+        conversation.conversationStatus ||
+        conversation.conversation_status ||
+        conversation.state ||
+        contact?.conversationStatus ||
+        contact?.conversation_status,
+      assignee:
+        conversation.assignee ||
+        conversation.assignedTo ||
+        conversation.assigned_to ||
+        conversation.assigneeId ||
+        conversation.assignee_id ||
+        conversation.assigneeEmail ||
+        conversation.assignee_email ||
+        contact?.assignee ||
+        contact?.assignedTo ||
+        contact?.assigned_to,
+      lastHumanActivityAt:
+        conversation.lastHumanActivityAt ||
+        conversation.last_human_activity_at ||
+        conversation.lastAssigneeActivityAt ||
+        conversation.last_assignee_activity_at ||
+        conversation.lastMessageAt ||
+        conversation.last_message_at ||
+        conversation.updatedAt ||
+        conversation.updated_at ||
+        conversation.assignedAt ||
+        conversation.assigned_at,
+      openedAt:
+        conversation.openedAt ||
+        conversation.opened_at ||
+        conversation.reopenedAt ||
+        conversation.reopened_at ||
+        conversation.createdAt ||
+        conversation.created_at ||
+        contact?.conversationOpenedAt ||
+        contact?.conversation_opened_at,
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function getRespondCustomFieldMap(contact) {
+  const entries = []
+
+  for (const source of [
+    contact?.custom_fields,
+    contact?.customFields,
+    contact?.customFieldsMap,
+    contact?.custom_field_values,
+    contact?.customFieldValues,
+    contact?.fields,
+  ]) {
+    if (Array.isArray(source)) {
+      entries.push(
+        ...source
+          .map((field) => [
+            field.name || field.label || field.title || field.id || field.key || '',
+            normalizeRespondFieldValue(
+              field.value ?? field.text ?? field.content ?? field.selectedValue ?? '',
+            ),
+          ])
+          .filter(([name, value]) => name && value != null && String(value).trim()),
+      )
+    } else if (source && typeof source === 'object') {
+      entries.push(
+        ...Object.entries(source)
+          .map(([name, value]) => [name, normalizeRespondFieldValue(value)])
+          .filter(([name, value]) => name && value != null && String(value).trim()),
+      )
+    }
+  }
+
+  const fields = {}
+
+  for (const [name, value] of entries) {
+    fields[name] = value
+    fields[normalizeRespondFieldKey(name)] = value
+  }
+
+  return fields
+}
+
+function getRespondTagNames(contact) {
+  return (contact?.tags || [])
+    .map((tag) => (typeof tag === 'string' ? tag : tag.name || tag.label || ''))
+    .filter(Boolean)
+}
+
+function buildRespondContactSignalSummary({ customFields, tags, contact }) {
+  const phone = extractRespondContactPhone(contact, customFields)
+  const contactStatus = getRespondContactStatus(customFields, contact)
+
+  return Object.fromEntries(
+    Object.entries({
+      leadStatus: customFields.lead_status,
+      classification: customFields.classification,
+      hasHubspotId: Boolean(customFields.hubspot_id),
+      hasPhone: Boolean(phone),
+      state: customFields.state || customFields.state1,
+      treatment: customFields.treatment || customFields.desired_treatment_form,
+      contactStatus,
+      lifecycle: contact?.lifecycle,
+      tags: tags.length ? tags.join(', ') : '',
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function getRespondContactStatus(customFields = {}, contact = {}) {
+  return resolveRespondContactStatus(customFields, contact)
+}
+
+function normalizeRespondFieldKey(name) {
+  return normalizeSearchText(name).replace(/\s+/g, '_')
+}
+
+function normalizeRespondFieldValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(normalizeRespondFieldValue).filter(Boolean).join(', ')
+  }
+
+  if (value && typeof value === 'object') {
+    return normalizeRespondFieldValue(
+      value.value ?? value.name ?? value.label ?? value.title ?? value.text ?? '',
+    )
+  }
+
+  return value
+}
+
+function buildRespondContactBookingDetails({ contact, customFields }) {
+  const phone = extractRespondContactPhone(contact, customFields)
+  const contactName = extractRespondContactName(contact, customFields)
+
+  return Object.fromEntries(
+    Object.entries({
+      firstName: contact?.firstName || contactName.firstName,
+      lastName: contact?.lastName || contactName.lastName,
+      phone,
+      email: isPlaceholderEmail(contact?.email) ? '' : contact?.email,
+      state: normalizeRespondState(customFields.state || customFields.state1),
+      desiredTreatment: customFields.treatment || customFields.desired_treatment_form,
+      preferredLanguage: normalizeRespondContactLanguage(contact?.language),
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function extractRespondContactName(contact, customFields = {}) {
+  const directName = [
+    contact?.fullName,
+    contact?.name,
+    contact?.displayName,
+    customFields.full_name,
+    customFields.fullName,
+    customFields.name,
+    customFields.Name,
+  ]
+    .map((value) => String(value || '').trim())
+    .find((value) => isLikelyCustomerName(value) && !extractPhoneNumber(value))
+
+  return directName ? splitCustomerName(directName) : {}
+}
+
+function getRespondContactBookingDetails(profile) {
+  return profile?.bookingDetails || {}
+}
+
+function getCustomerFirstName(details = {}, profile = {}) {
+  return String(details.firstName || profile?.bookingDetails?.firstName || '')
+    .split(/\s+/)[0]
+    .trim()
+}
+
+function mergeRespondContactProfileFallbacks(profile, fallbacks = {}) {
+  if (!fallbacks.phone || profile?.bookingDetails?.phone) {
+    return profile
+  }
+
+  return {
+    ...profile,
+    bookingDetails: {
+      ...(profile?.bookingDetails || {}),
+      phone: fallbacks.phone,
+    },
+  }
+}
+
+function normalizeRespondState(value) {
+  const state = extractStateName(String(value || ''))
+
+  return state || String(value || '').split(/[-–]/)[0].trim()
+}
+
+function normalizeRespondContactLanguage(language) {
+  const normalized = String(language || '').toLowerCase()
+
+  if (normalized.startsWith('es')) {
+    return 'Latin American Spanish'
+  }
+
+  if (normalized.startsWith('pt')) {
+    return 'Portuguese'
+  }
+
+  if (normalized.startsWith('en')) {
+    return 'English'
+  }
+
+  return ''
+}
+
+function isPlaceholderEmail(email) {
+  return /@dummy\.com$/i.test(String(email || ''))
+}
+
+function formatRespondContactProfileForPrompt(profile) {
+  const firstName = getCustomerFirstName(profile?.bookingDetails, profile)
+  const fields = profile.fields
+    ? Object.entries(profile.fields)
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ')
+    : ''
+
+  return [
+    'Respond contact profile context:',
+    `Contact status identifier: ${profile.status} (${profile.label}).`,
+    `Reason: ${profile.reason}`,
+    firstName ? `Customer first name: ${firstName}. Use it naturally sometimes, especially in explanatory or out-of-flow replies, but do not repeat it in every message.` : '',
+    fields ? `Current Respond signals: ${fields}` : '',
+    'Use this only for routing and tone. Do not mention internal field names or IDs to the customer.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function formatBookingContextForPrompt(booking = {}) {
+  const details = booking.details || {}
+  const firstName = getCustomerFirstName(details)
+  const offeredOption = booking.offeredOption
+  const options = booking.options || []
+  const lines = [
+    'Current booking flow context:',
+    firstName ? `Customer first name: ${firstName}.` : '',
+    booking.pendingField ? `Pending field: ${booking.pendingField}.` : '',
+    details.state ? `Known state: ${details.state}.` : '',
+    details.desiredTreatment ? `Known desired treatment/goal: ${details.desiredTreatment}.` : '',
+    details.phone ? 'Customer phone is already known from Respond/contact context.' : '',
+    offeredOption
+      ? `Already offered slot: ${formatCustomerStateSlot(
+        offeredOption.startTime,
+        details.state,
+        offeredOption.timezone,
+      )}.`
+      : '',
+    options.length
+      ? `Already offered numbered slots:\n${formatNumberedSlots(options, details.state)}`
+      : '',
+    booking.pendingField === 'state' && !details.state
+      ? 'The next required flow step is the customer state. If the latest customer message asks a question or goes out of flow, answer it briefly first, then ask which state they live in before offering availability or asking for phone.'
+      : '',
+    'Never invent a customer city, state, or previously mentioned location. Only use a state shown above as Known state or explicitly stated by the latest customer message.',
+    'If the latest customer message asks an information question, answer it from company knowledge first. Then briefly return to the current booking flow without asking for details already known or inventing availability.',
+  ].filter(Boolean)
+
+  return lines.join('\n')
+}
+
+function getBookingTeamForRespondContact(profile) {
+  return isCustomerServiceBookingStatus(profile) ? 'customer_service' : 'sales'
+}
+
+function shouldConfirmNameBeforeRespondBooking(profile = {}, details = {}) {
+  return shouldUseNewClientBookingFlow(profile) && !hasConfirmedFullName(details)
+}
+
+function hasBookableRespondCustomerName(details = {}, profile = {}) {
+  return !shouldConfirmNameBeforeRespondBooking(profile, details)
+}
+
+function getCurrentRespondBookingTeam(existingBooking = {}, profile = {}) {
+  const profileBookingTeam = getBookingTeamForRespondContact(profile)
+  const hasCurrentRoutingSignal =
+    isCustomerServiceBookingStatus(profile) ||
+    Boolean(String(profile?.fields?.contactStatus || '').trim())
+
+  return hasCurrentRoutingSignal
+    ? profileBookingTeam
+    : existingBooking.bookingTeam || profileBookingTeam
+}
+
+const RESPOND_BOOKING_INTENTS = new Set([
+  'booking_detail',
+  'complex_question',
+  'pricing',
+  'medical_safety',
+  'provider_question',
+  'objection',
+  'support_issue',
+  'location_question',
+  'handoff',
+  'other',
+])
+const RESPOND_BOOKING_RISK_LEVELS = new Set(['low', 'medium', 'high'])
+const RESPOND_BOOKING_FIELDS = new Set(['state', 'phone', 'name', 'preferredTime', 'slot', 'none'])
+const HIGH_RISK_MODEL_INTENTS = new Set([
+  'pricing',
+  'medical_safety',
+  'provider_question',
+  'support_issue',
+  'location_question',
+  'handoff',
+])
+const ALLOWED_RAG_SOURCE_TYPES = new Set([
+  'company_info',
+  'raw_conversation',
+  'approved_example',
+  'sales_script',
+  'product_info',
+  'compliance',
+])
+const DEFAULT_RAG_SOURCE_TYPES = [
+  'company_info',
+  'raw_conversation',
+  'approved_example',
+  'sales_script',
+  'product_info',
+  'compliance',
+]
+
+async function classifyRespondBookingIntent({
+  messages = [],
+  latestUserText = '',
+  customerLanguage = '',
+  booking = {},
+  latestSignals = {},
+} = {}) {
+  const startedAt = Date.now()
+  const fallback = inferRespondBookingIntent({
+    latestUserText,
+    messages,
+    latestSignals,
+  })
+
+  if (!process.env.OPENAI_API_KEY || !latestUserText.trim()) {
+    logModelUsage({
+      callType: 'respond_booking_intent',
+      ...fallback,
+      pendingField: booking.pendingField,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallback
+  }
+
+  try {
+    const text = await createOpenAIResponseText({
+      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+      instructions: [
+        'Classify the latest customer message for a clinic booking automation.',
+        'Return strict JSON only. No markdown, no prose.',
+        'Schema: {"intent":"booking_detail|complex_question|pricing|medical_safety|provider_question|objection|support_issue|location_question|handoff|other","risk_level":"low|medium|high","needs_rag":true|false,"should_answer_question":true|false,"answered_booking_field":"state|phone|name|preferredTime|slot|none"}',
+        'Use answered_booking_field only when the latest customer message clearly provides that exact booking detail. Do not infer state from a city unless the customer states the state.',
+        'Set should_answer_question true when the customer asks a question, raises an objection, asks for safety/provider/pricing/product details, or needs a contextual answer before the booking flow continues.',
+        'A rejection of an offered appointment such as "No puedo esa hora", "That time does not work", or "Nao posso nesse horario" is a booking detail, not a question or general objection: set intent to booking_detail, should_answer_question false, needs_rag false, and answered_booking_field preferredTime.',
+        'Set needs_rag true for pricing, products, provider/doctor, FDA, shipping, legitimacy, safety, medical, support, refund, or compliance topics.',
+        'When uncertain, choose other, medium risk, and should_answer_question false.',
+      ].join('\n'),
+      input: buildModelIntentInput({
+        messages,
+        latestUserText,
+        customerLanguage,
+        booking,
+        latestSignals,
+      }),
+    })
+    const parsed = parseJsonObject(text)
+    const classified = normalizeRespondBookingIntent(parsed, fallback)
+
+    logModelUsage({
+      callType: 'respond_booking_intent',
+      ...classified,
+      pendingField: booking.pendingField,
+      fallbackUsed: false,
+      durationMs: Date.now() - startedAt,
+    })
+    return classified
+  } catch (error) {
+    console.warn(`Respond booking intent classification skipped: ${error.message}`)
+    logModelUsage({
+      callType: 'respond_booking_intent',
+      ...fallback,
+      pendingField: booking.pendingField,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallback
+  }
+}
+
+function buildModelIntentInput({
+  messages = [],
+  latestUserText = '',
+  customerLanguage = '',
+  booking = {},
+  latestSignals = {},
+}) {
+  const recentConversation = messages
+    .slice(-6)
+    .map((item) => `${item.role || 'user'}: ${redactPromptLogText(item.content || '')}`)
+    .join('\n')
+  const knownSignals = Object.entries({
+    state: latestSignals.state,
+    phone: latestSignals.phone ? 'provided' : '',
+    preferredTime: latestSignals.preferredTime,
+    desiredTreatment: latestSignals.desiredTreatment,
+  })
+    .filter(([, value]) => Boolean(value))
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('; ')
+
+  return [
+    customerLanguage ? `Customer language: ${customerLanguage}` : '',
+    `Pending booking field: ${booking.pendingField || 'none'}`,
+    booking.offeredOption || booking.options?.length ? 'A real calendar slot has already been offered by the application.' : '',
+    knownSignals ? `Latest deterministic booking signals: ${knownSignals}` : '',
+    `Latest customer message: ${redactPromptLogText(latestUserText)}`,
+    recentConversation ? `Recent conversation:\n${recentConversation}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function inferRespondBookingIntent({ latestUserText = '', messages = [], latestSignals = {} } = {}) {
+  const normalized = normalizeSearchText(latestUserText)
+  const answeredField =
+    latestSignals.state ? 'state' :
+      latestSignals.phone ? 'phone' :
+        latestSignals.preferredTime ? 'preferredTime' :
+          'none'
+
+  if (answeredField !== 'none') {
+    return {
+      intent: 'booking_detail',
+      risk_level: 'low',
+      needs_rag: false,
+      should_answer_question: false,
+      answered_booking_field: answeredField,
+    }
+  }
+
+  if (isMedicalHistoryOrSafetyQuestion(normalized)) {
+    return {
+      intent: 'medical_safety',
+      risk_level: 'high',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (hasPriceOrPaymentQuestion(normalized)) {
+    return {
+      intent: 'pricing',
+      risk_level: 'high',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (isSalesObjection(normalized)) {
+    return {
+      intent: 'objection',
+      risk_level: 'medium',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (isSupportOrHandoffRequest(normalized)) {
+    return {
+      intent: 'support_issue',
+      risk_level: 'high',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (/\b(doctor|doctors|provider|providers|medico|medicos|doctores|proveedor|doutor)\b/.test(normalized)) {
+    return {
+      intent: 'provider_question',
+      risk_level: 'high',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (isLocationQuestion(normalized)) {
+    return {
+      intent: 'location_question',
+      risk_level: 'medium',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  if (isOutOfFlowInfoQuestion(latestUserText) || isContextualOutOfFlowFollowUp(latestUserText, messages)) {
+    return {
+      intent: 'complex_question',
+      risk_level: 'medium',
+      needs_rag: true,
+      should_answer_question: true,
+      answered_booking_field: 'none',
+    }
+  }
+
+  return {
+    intent: 'other',
+    risk_level: 'medium',
+    needs_rag: false,
+    should_answer_question: false,
+    answered_booking_field: 'none',
+  }
+}
+
+function isSalesObjection(normalized) {
+  return [
+    /\b(expensive|too much|costly|afford|pricey|scared|afraid|nervous|not sure|unsure|legit|trust|safe)\b/,
+    /\b(caro|cara|costoso|costosa|miedo|nerviosa|nervioso|seguro|segura|confiable|legitimo|legitima)\b/,
+    /\b(caro|cara|medo|nervoso|nervosa|seguro|segura|confiavel|legitimo|legitima)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isAffordabilityObjection(content = '') {
+  return hasAffordabilityObjection(content)
+}
+
+function getAffordabilityAnswer(language) {
+  const normalizedLanguage = normalizeLanguageName(language)
+
+  if (normalizedLanguage === 'Latin American Spanish') {
+    return 'Entiendo que el precio puede ser mucho para ti. Tenemos diferentes opciones de pago que pueden incluir pagos quincenales o mensuales, tarjeta de débito o crédito, Venmo, Zelle, Afterpay, Klarna, Affirm y CareCredit, según disponibilidad y aprobación. La llamada de análisis es gratuita y nuestra especialista puede explicarte estas opciones sin compromiso.'
+  }
+
+  if (normalizedLanguage === 'Portuguese') {
+    return 'Entendo que o valor pode ser alto para você. Temos diferentes opções de pagamento, que podem incluir pagamentos quinzenais ou mensais, cartão de débito ou crédito, Venmo, Zelle, Afterpay, Klarna, Affirm e CareCredit, conforme disponibilidade e aprovação. A chamada de análise é gratuita, e nossa especialista pode explicar essas opções sem compromisso.'
+  }
+
+  return 'I understand that the price may feel like too much. We have different payment options that may include biweekly or monthly payments, debit or credit card, Venmo, Zelle, Afterpay, Klarna, Affirm, and CareCredit, subject to availability and approval. The discovery call is free, and our specialist can explain these options with no obligation.'
+}
+
+function isSupportOrHandoffRequest(normalized) {
+  return [
+    /\b(refund|replacement|complaint|order issue|side effects|already a client|customer service|support|human|agent)\b/,
+    /\b(reembolso|devolucion|reemplazo|queja|reclamo|servicio al cliente|soporte|humano|persona)\b/,
+    /\b(reembolso|troca|substituicao|reclamacao|atendimento|suporte|humano|pessoa)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function normalizeRespondBookingIntent(value = {}, fallback) {
+  const intent = RESPOND_BOOKING_INTENTS.has(value.intent) ? value.intent : fallback.intent
+  const riskLevel = RESPOND_BOOKING_RISK_LEVELS.has(value.risk_level)
+    ? value.risk_level
+    : fallback.risk_level
+  const answeredBookingField = RESPOND_BOOKING_FIELDS.has(value.answered_booking_field)
+    ? value.answered_booking_field
+    : fallback.answered_booking_field
+
+  return {
+    intent,
+    risk_level: riskLevel,
+    needs_rag: typeof value.needs_rag === 'boolean' ? value.needs_rag : fallback.needs_rag,
+    should_answer_question:
+      typeof value.should_answer_question === 'boolean'
+        ? value.should_answer_question
+        : fallback.should_answer_question,
+    answered_booking_field: answeredBookingField,
+  }
+}
+
+function shouldRequireRagForModelAnswer(modelIntent = {}) {
+  return (
+    modelIntent.needs_rag ||
+    modelIntent.risk_level === 'high' ||
+    HIGH_RISK_MODEL_INTENTS.has(modelIntent.intent)
+  )
+}
+
+async function planRagSearch({
+  agent,
+  messages = [],
+  message = '',
+  modelIntent = null,
+  fallbackQuery = '',
+} = {}) {
+  const startedAt = Date.now()
+  const fallback = inferRagSearchPlan({
+    message,
+    modelIntent,
+    fallbackQuery,
+  })
+
+  if (!process.env.OPENAI_API_KEY || !fallback.query.trim()) {
+    logModelUsage({
+      callType: 'rag_query_plan',
+      ...(modelIntent || {}),
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallback
+  }
+
+  try {
+    const text = await createOpenAIResponseText({
+      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+      instructions: [
+        'Plan a retrieval search for a clinic sales/support assistant.',
+        'Return strict JSON only. No markdown, no prose.',
+        'Schema: {"query":"short search query","source_types":["company_info|raw_conversation|approved_example|sales_script|product_info|compliance"],"match_count":1-8}',
+        'Rewrite the query to retrieve the most relevant company knowledge for the latest customer message. Include important context from the recent conversation when pronouns like that, it, this, or about that are used.',
+        'Choose only source types from the schema. Use compliance for FDA, safety, privacy, refunds, medical, provider, and shipping policy questions. Use product_info for products, pricing, Semaglutide, Tirzepatide, Zepbound, GHK-Cu, supplements, and side effects. Use sales_script or approved_example for objections and sales workflow. Use company_info for legitimacy, location, appointments, and general company facts.',
+        'Do not include phone numbers, emails, names, addresses, diagnoses, medication lists, or private details in the query.',
+      ].join('\n'),
+      input: buildRagPlanInput({
+        agent,
+        messages,
+        message,
+        modelIntent,
+        fallback,
+      }),
+    })
+    const parsed = parseJsonObject(text)
+    const plan = normalizeRagSearchPlan(parsed, fallback)
+
+    logModelUsage({
+      callType: 'rag_query_plan',
+      ...(modelIntent || {}),
+      fallbackUsed: false,
+      durationMs: Date.now() - startedAt,
+    })
+    return plan
+  } catch (error) {
+    console.warn(`RAG query planning skipped: ${error.message}`)
+    logModelUsage({
+      callType: 'rag_query_plan',
+      ...(modelIntent || {}),
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallback
+  }
+}
+
+function buildRagPlanInput({
+  agent,
+  messages = [],
+  message = '',
+  modelIntent = null,
+  fallback = {},
+}) {
+  const recentConversation = messages
+    .slice(-6)
+    .map((item) => `${item.role || 'user'}: ${redactPromptLogText(item.content || '')}`)
+    .join('\n')
+
+  return [
+    `Agent: ${agent?.id || 'sales'}`,
+    modelIntent ? `Intent: ${modelIntent.intent || 'other'}` : '',
+    modelIntent ? `Risk level: ${modelIntent.risk_level || 'medium'}` : '',
+    `Fallback query: ${redactPromptLogText(fallback.query || message)}`,
+    `Latest customer message: ${redactPromptLogText(message)}`,
+    recentConversation ? `Recent conversation:\n${recentConversation}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function inferRagSearchPlan({ message = '', modelIntent = null, fallbackQuery = '' } = {}) {
+  const query = redactPromptLogText(fallbackQuery || message).trim()
+  const intent = modelIntent?.intent || inferRespondBookingIntent({ latestUserText: message }).intent
+  const sourceTypesByIntent = {
+    pricing: ['product_info', 'sales_script', 'company_info', 'compliance'],
+    medical_safety: ['compliance', 'product_info', 'company_info'],
+    provider_question: ['compliance', 'company_info', 'sales_script'],
+    objection: ['sales_script', 'approved_example', 'product_info', 'company_info'],
+    support_issue: ['compliance', 'company_info', 'sales_script'],
+    location_question: ['company_info', 'compliance'],
+    handoff: ['compliance', 'company_info'],
+    complex_question: ['company_info', 'product_info', 'compliance', 'sales_script'],
+  }
+
+  return {
+    query,
+    source_types: sourceTypesByIntent[intent] || DEFAULT_RAG_SOURCE_TYPES,
+    match_count: HIGH_RISK_MODEL_INTENTS.has(intent) ? 8 : 6,
+  }
+}
+
+function normalizeRagSearchPlan(value = {}, fallback) {
+  const query = redactPromptLogText(value.query || fallback.query || '').trim()
+  const sourceTypes = Array.isArray(value.source_types)
+    ? value.source_types.filter((sourceType) => ALLOWED_RAG_SOURCE_TYPES.has(sourceType))
+    : []
+  const matchCount = Number(value.match_count)
+
+  return {
+    query: query || fallback.query,
+    source_types: sourceTypes.length ? [...new Set(sourceTypes)].slice(0, 4) : fallback.source_types,
+    match_count: Number.isInteger(matchCount) && matchCount >= 1 && matchCount <= 8
+      ? matchCount
+      : fallback.match_count,
+  }
+}
+
+function logModelUsage({
+  callType,
+  intent = 'other',
+  risk_level: riskLevel = 'medium',
+  needs_rag: needsRag = false,
+  should_answer_question: shouldAnswerQuestion = false,
+  answered_booking_field: answeredBookingField = 'none',
+  pendingField = '',
+  ragMatchCount = null,
+  ragSourceTypes = null,
+  guardrailBlocked = false,
+  guardrailReason = '',
+  fallbackUsed = false,
+  durationMs = null,
+} = {}) {
+  const payload = {
+    call_type: callType,
+    intent,
+    risk_level: riskLevel,
+    needs_rag: Boolean(needsRag),
+    should_answer_question: Boolean(shouldAnswerQuestion),
+    answered_booking_field: answeredBookingField || 'none',
+    pending_field: pendingField || '',
+    rag_match_count: ragMatchCount,
+    rag_source_types: Array.isArray(ragSourceTypes) ? ragSourceTypes : null,
+    guardrail_blocked: Boolean(guardrailBlocked),
+    guardrail_reason: guardrailReason || '',
+    fallback_used: Boolean(fallbackUsed),
+    duration_ms: durationMs,
+  }
+
+  console.info(`[model_usage] ${JSON.stringify(payload)}`)
+}
+
+function redactPromptLogText(value) {
+  return String(value || '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+    .replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4,}/g, '[phone]')
+    .replace(/\b\d{1,5}\s+[A-Za-z0-9 .'-]+\s+(street|st|avenue|ave|road|rd|drive|dr|lane|ln|court|ct|blvd|boulevard)\b/gi, '[address]')
+    .slice(0, 1200)
+}
+
+function parseJsonObject(value) {
+  const text = String(value || '').trim()
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim()
+  const candidate = fenced || text.match(/\{[\s\S]*\}/)?.[0] || text
+
+  return JSON.parse(candidate)
+}
+
+async function handleRespondBookingAutomation({
+  session,
+  messages,
+  customerLanguage,
+  respondContactProfile,
+}) {
+  let existingBooking = {
+    ...(session.booking || {}),
+    contactId: respondContactProfile?.contactId || session.booking?.contactId || '',
+  }
+  let acceptedSlotClaimLost = false
+  if (existingBooking.slotClaim && existingBooking.offeredOption) {
+    try {
+      const renewedClaim = await acquireSlotClaim({
+        option: existingBooking.offeredOption,
+        contactId: existingBooking.slotClaim.contactId || existingBooking.contactId,
+      })
+      if (renewedClaim.acquired) {
+        existingBooking = {
+          ...existingBooking,
+          slotClaim: buildPersistedSlotClaim(renewedClaim, existingBooking.slotClaim.contactId || existingBooking.contactId),
+        }
+      } else {
+        acceptedSlotClaimLost = true
+        existingBooking = { ...existingBooking, slotClaim: null }
+      }
+    } catch (error) {
+      console.warn(`Unable to renew accepted slot claim: ${error.message}`)
+    }
+  }
+  const bookingTeam = getCurrentRespondBookingTeam(existingBooking, respondContactProfile)
+  const latestUserText = [...messages].reverse().find((item) => item.role === 'user')?.content || ''
+  const collectingName = existingBooking.pendingField === 'name'
+  const conversationSignals = extractRespondBookingDetails(
+    collectingName ? messages.slice(0, -1) : messages,
+  )
+  const latestSignals = removeAvailabilitySignalsFromNameReply(
+    extractRespondBookingDetailsFromText(latestUserText),
+    existingBooking.pendingField,
+  )
+  const okMeansAffirmative = shouldTreatOkAsAffirmative({
+    content: latestUserText,
+    activeState: existingBooking.details?.state,
+    inferredState: existingBooking.details?.inferredState,
+    hasActiveSlot: Boolean(existingBooking.offeredOption || existingBooking.options?.length),
+  })
+
+  if (okMeansAffirmative) {
+    delete latestSignals.state
+  }
+
+  const hasUnresolvedExplicitState =
+    existingBooking.pendingField === 'state' &&
+    looksLikeExplicitStateDeclaration(latestUserText) &&
+    !latestSignals.state
+  const latestNameDetails =
+    existingBooking.pendingField === 'name'
+      ? mergeCustomerNameReply(existingBooking.details || {}, latestUserText)
+      : {}
+  const latestPreferredTime = resolveRespondPreferredTime({
+    existingDetails: existingBooking.details,
+    latestSignals,
+    latestUserText,
+  })
+  let details = {
+    ...getRespondContactBookingDetails(respondContactProfile),
+    ...(existingBooking.details || {}),
+    ...conversationSignals,
+    ...latestSignals,
+    ...latestNameDetails,
+    ...(latestPreferredTime ? { preferredTime: latestPreferredTime } : {}),
+  }
+  // The active/confirmed booking state wins over stale profile and historical
+  // values. Only a state explicitly present in the latest message may change it.
+  details.state = chooseConfirmedState({
+    latestState: latestSignals.state,
+    activeState: existingBooking.details?.state,
+    profileState: getRespondContactBookingDetails(respondContactProfile).state,
+    historicalState: conversationSignals.state,
+  })
+  details = applyAvailabilityConstraintFromPreferredTime(details)
+  details = withDefaultRespondDesiredTreatment(details)
+  details = applyNewClientBookingRequirements(details, {
+    existingBooking,
+    messages,
+    respondContactProfile,
+  })
+  const modelIntent = await classifyRespondBookingIntent({
+    messages,
+    latestUserText,
+    customerLanguage,
+    booking: { ...existingBooking, bookingTeam, details },
+    latestSignals,
+  })
+  const recognizedStateQualificationReply = isRecognizedStateQualificationReply({
+    pendingField: existingBooking.pendingField,
+    state: latestSignals.state,
+    content: latestUserText,
+  })
+
+  if (
+    existingBooking.pendingField === 'name' &&
+    /^domingo[?.!]*$/i.test(String(latestUserText || '').trim())
+  ) {
+    return {
+      text: bookingCopy(customerLanguage, 'clarifySundayOrName'),
+      booking: { ...existingBooking, bookingTeam, details, pendingField: 'name' },
+    }
+  }
+  const afterWorkConstraint = extractAfterWorkConstraint(latestUserText)
+  if (afterWorkConstraint) {
+    details = { ...details, ...afterWorkConstraint }
+  }
+
+  if (hasUnresolvedExplicitState) {
+    return buildUnrecognizedStateAttemptResponse({
+      existingBooking,
+      bookingTeam,
+      details: { ...details, state: existingBooking.details?.state || '' },
+      customerLanguage,
+    })
+  }
+
+  const deterministicPolicyAnswer =
+    isGeneralProductInfoRequest(latestUserText)
+      ? getGeneralProductOverviewAnswer(customerLanguage)
+      : isInsuranceQuestion(latestUserText)
+      ? getInsuranceAnswer(customerLanguage)
+      : isInitialConsultationCostQuestion(latestUserText)
+        ? getInitialConsultationCostAnswer(customerLanguage)
+        : isGeneralZepboundQuestion(latestUserText)
+          ? getGeneralMedicationOfferingAnswer(customerLanguage)
+          : isPrescribedTreatmentDeclination(latestUserText)
+      ? getPrescribedTreatmentDeclinationAnswer(customerLanguage)
+      : isAffordabilityObjection(latestUserText) || isContextualAffordabilityObjection(latestUserText, messages)
+      ? getAffordabilityAnswer(customerLanguage)
+      : isTreatmentPackageInclusionsQuestion(latestUserText)
+        ? getTreatmentPackageInclusionsAnswer(customerLanguage)
+      : isPastSupplementUseMention(latestUserText)
+        ? getPastSupplementUseAnswer(customerLanguage)
+      : isGhkProductQuestion(latestUserText)
+        ? getGhkProductAnswer(customerLanguage)
+        : isSupplementProductQuestion(latestUserText) || isContextualSupplementQuestion(latestUserText, messages)
+          ? getSupplementProductAnswer(customerLanguage, latestUserText)
+          : isOralProductQuestion(latestUserText)
+            ? getOralProductAnswer(customerLanguage)
+            : isUnambiguouslyGeneralMedicationQuestion(latestUserText)
+              ? getGeneralMedicationOfferingAnswer(customerLanguage)
+              : isGeneralMedicationSafetyQuestion(latestUserText)
+                ? getGeneralMedicationSafetyAnswer(customerLanguage)
+                : !recognizedStateQualificationReply && (
+                  isClientTreatmentPrivacyQuestion(latestUserText) ||
+                  isContextualClientPrivacyFollowUp(latestUserText, messages)
+                )
+                  ? getClientPrivacyAnswer(customerLanguage)
+                  : isMedicalHistoryOrSafetyQuestion(normalizeSearchText(latestUserText)) &&
+                    !isReboundEffectQuestion(latestUserText)
+                    ? getOutOfFlowAnswer(latestUserText, customerLanguage)
+                    : ''
+
+  if (deterministicPolicyAnswer) {
+    if (isPrescribedTreatmentDeclination(latestUserText)) {
+      return {
+        text: deterministicPolicyAnswer,
+        booking: {
+          ...buildBookingWithExcludedOptions({ ...existingBooking, bookingTeam }),
+          details: {
+            ...details,
+            desiredTreatment: 'supplements or nutrition support',
+          },
+          pendingField: '',
+          prescribedTreatmentDeclined: true,
+        },
+      }
+    }
+
+    if (existingBooking.pendingField === 'state' && details.state) {
+      const nextDetails = withDefaultRespondDesiredTreatment(details)
+
+      if (shouldUseOutOfStatePrescribedTemplate(nextDetails)) {
+        const qualification = shouldUseRepeatOutOfStateTemplate(existingBooking, nextDetails)
+          ? outOfStatePrescribedRepeatTemplate(customerLanguage)
+          : outOfStatePrescribedTemplate(customerLanguage)
+
+        return {
+          text: [deterministicPolicyAnswer, qualification].filter(Boolean).join('\n\n'),
+          booking: {
+            ...existingBooking,
+            bookingTeam,
+            details: nextDetails,
+            pendingField: 'state',
+            outOfStateNotified: true,
+          },
+        }
+      }
+
+      if (!nextDetails.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+        return {
+          text: [deterministicPolicyAnswer, bookingCopy(customerLanguage, 'askPhone')].join('\n\n'),
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        }
+      }
+
+      const offer = await offerSoonestRespondSlot({
+        booking: { ...existingBooking, bookingTeam, pendingField: '' },
+        details: nextDetails,
+        customerLanguage,
+      })
+
+      return {
+        ...offer,
+        text: [deterministicPolicyAnswer, offer.text].filter(Boolean).join('\n\n'),
+      }
+    }
+
+    const activeOption = existingBooking.offeredOption || existingBooking.options?.[0]
+    let continuation = ''
+
+    if (existingBooking.pendingField === 'state' && !details.state) {
+      continuation = bookingCopy(customerLanguage, 'askState')
+    } else if (existingBooking.pendingField === 'phone') {
+      continuation = bookingCopy(
+        customerLanguage,
+        shouldUseNewClientBookingFlow(respondContactProfile) ? 'askUsPhone' : 'askPhone',
+      )
+    } else if (existingBooking.pendingField === 'preferredTime') {
+      continuation = bookingCopy(customerLanguage, 'askPreferredTime')
+    } else if (existingBooking.pendingField === 'name') {
+      continuation = bookingCopy(customerLanguage, 'askName')
+    } else if (activeOption) {
+      continuation = bookingCopy(customerLanguage, 'reofferSlot', {
+        slot: formatCustomerStateSlot(activeOption.startTime, details.state, activeOption.timezone, customerLanguage),
+      })
+    }
+
+    return {
+      text: [deterministicPolicyAnswer, continuation].filter(Boolean).join('\n\n'),
+      booking: { ...existingBooking, bookingTeam, details },
+    }
+  }
+
+  if (existingBooking.pendingField === 'state') {
+    const kansasLocation = resolveKansasLocationClarification(
+      latestUserText,
+      existingBooking.awaitingKansasLocation,
+    )
+
+    if (kansasLocation.needsClarification) {
+      return {
+        text: bookingCopy(customerLanguage, 'clarifyKansasLocation'),
+        booking: {
+          ...existingBooking,
+          bookingTeam,
+          details: { ...details, state: '' },
+          pendingField: 'state',
+          awaitingKansasLocation: true,
+        },
+      }
+    }
+
+    if (kansasLocation.state) {
+      latestSignals.state = kansasLocation.state
+      details.state = kansasLocation.state
+    } else if (existingBooking.awaitingKansasLocation && !latestSignals.state) {
+      return {
+        text: bookingCopy(customerLanguage, 'clarifyKansasLocation'),
+        booking: {
+          ...existingBooking,
+          bookingTeam,
+          details: { ...details, state: '' },
+          pendingField: 'state',
+          awaitingKansasLocation: true,
+        },
+      }
+    }
+
+    // A confirmed state may already be stored even if an older pendingField
+    // value still says "state". Do not make an unrelated follow-up (such as a
+    // pricing question) provide the state a second time.
+    const state = latestSignals.state || details.state
+
+    if (!state) {
+      if (existingBooking.details?.inferredState && isInferredStateAffirmation(latestUserText)) {
+        latestSignals.state = existingBooking.details.inferredState
+      } else if (existingBooking.details?.inferredState && isNegativeReply(latestUserText)) {
+        return {
+          text: bookingCopy(customerLanguage, 'askStateDifferent'),
+          booking: {
+            ...existingBooking,
+            bookingTeam,
+            details: {
+              ...details,
+              inferredCity: '',
+              inferredState: '',
+            },
+            pendingField: 'state',
+          },
+        }
+      }
+    }
+
+    let confirmedState = latestSignals.state || details.state
+
+    if (!confirmedState) {
+      const inferredLocation = inferStateFromCity(latestUserText)
+
+      if (inferredLocation) {
+        if (inferredLocation.ambiguous) {
+          return {
+            text: bookingCopy(customerLanguage, 'askCityState', inferredLocation),
+            booking: {
+              ...existingBooking,
+              bookingTeam,
+              details: {
+                ...details,
+                inferredCity: '',
+                inferredState: '',
+              },
+              pendingField: 'state',
+            },
+          }
+        }
+
+        confirmedState = inferredLocation.state
+        latestSignals.state = inferredLocation.state
+      }
+
+      if (!confirmedState && shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generatePendingStateOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: {
+            ...existingBooking,
+            bookingTeam,
+            details: { ...details, state: '' },
+            pendingField: 'state',
+          },
+          modelIntent,
+        })
+
+        return {
+          text: buildPendingStateOutOfFlowReply(answer, customerLanguage),
+          booking: {
+            ...existingBooking,
+            bookingTeam,
+            details: { ...details, state: '' },
+            pendingField: 'state',
+          },
+        }
+      }
+
+      if (!confirmedState) {
+        if (isNonAttemptPendingStateMessage(latestUserText)) {
+          return {
+            text: getPendingStateRecoveryText(latestUserText, customerLanguage),
+            booking: {
+              ...existingBooking,
+              bookingTeam,
+              details: { ...details, state: '' },
+              pendingField: 'state',
+            },
+          }
+        }
+
+        return buildUnrecognizedStateAttemptResponse({
+          existingBooking,
+          bookingTeam,
+          details: { ...details, state: '' },
+          customerLanguage,
+        })
+      }
+    }
+
+    let nextDetails = withDefaultRespondDesiredTreatment({
+      ...details,
+      state: confirmedState,
+      inferredCity: '',
+      inferredState: '',
+    })
+
+    existingBooking.stateClarificationAttempts = 0
+
+    // Once state qualification is complete, a pricing detour should resume
+    // scheduling with tomorrow's real calendar availability.
+    if (modelIntent.intent === 'pricing' && !nextDetails.preferredTime) {
+      nextDetails = applyAvailabilityConstraintFromPreferredTime({
+        ...nextDetails,
+        preferredTime: 'tomorrow',
+      })
+    }
+
+    if (shouldUseOutOfStatePrescribedTemplate(nextDetails)) {
+      return {
+        text: shouldUseRepeatOutOfStateTemplate(existingBooking, nextDetails)
+          ? outOfStatePrescribedRepeatTemplate(customerLanguage)
+          : outOfStatePrescribedTemplate(customerLanguage),
+        booking: {
+          ...existingBooking,
+          bookingTeam,
+          details: nextDetails,
+          pendingField: 'state',
+          outOfStateNotified: true,
+        },
+      }
+    }
+
+    if (!nextDetails.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPhone')}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        }
+      }
+
+      return prependOutOfFlowAnswerIfNeeded({
+        response: {
+          text: bookingCopy(customerLanguage, 'askPhone'),
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        },
+        latestUserText,
+        customerLanguage,
+        booking: existingBooking,
+        details: nextDetails,
+      })
+    }
+
+    const offer = await offerSoonestRespondSlot({
+      booking: { ...existingBooking, bookingTeam, pendingField: '' },
+      details: nextDetails,
+      customerLanguage,
+    })
+
+    if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+      const answer = await generateBookingOutOfFlowAnswer({
+        messages,
+        latestUserText,
+        customerLanguage,
+        respondContactProfile,
+        booking: { ...existingBooking, bookingTeam, details: nextDetails },
+        modelIntent,
+      })
+
+      return {
+        ...offer,
+        text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${offer.text}`,
+      }
+    }
+
+    return prependOutOfFlowAnswerIfNeeded({
+      response: offer,
+      latestUserText,
+      customerLanguage,
+      booking: existingBooking,
+      details: nextDetails,
+    })
+  }
+
+  if (existingBooking.pendingField === 'goals') {
+    const nextDetails = withDefaultRespondDesiredTreatment(details)
+
+    if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+      const answer = await generateBookingOutOfFlowAnswer({
+        messages,
+        latestUserText,
+        customerLanguage,
+        respondContactProfile,
+        booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'goals' },
+        modelIntent,
+      })
+
+      if (!nextDetails.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPhone')}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        }
+      }
+
+      const offer = await offerSoonestRespondSlot({
+        booking: { ...existingBooking, bookingTeam, pendingField: '' },
+        details: nextDetails,
+        customerLanguage,
+      })
+
+      return {
+        ...offer,
+        text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${offer.text}`,
+      }
+    }
+
+    if (shouldUseOutOfStatePrescribedTemplate(nextDetails)) {
+      return {
+        text: shouldUseRepeatOutOfStateTemplate(existingBooking, nextDetails)
+          ? outOfStatePrescribedRepeatTemplate(customerLanguage)
+          : outOfStatePrescribedTemplate(customerLanguage),
+        booking: {
+          ...existingBooking,
+          bookingTeam,
+          details: nextDetails,
+          pendingField: 'state',
+          outOfStateNotified: true,
+        },
+      }
+    }
+
+    if (!nextDetails.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+      return {
+        text: bookingCopy(customerLanguage, 'askPhone'),
+        booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+      }
+    }
+
+    return await offerSoonestRespondSlot({
+      booking: { ...existingBooking, bookingTeam, pendingField: '' },
+      details: nextDetails,
+      customerLanguage,
+    })
+  }
+
+  if (existingBooking.pendingField === 'preferredTime') {
+    if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent) && !extractPreferredTimeText(latestUserText)) {
+      const answer = await generateBookingOutOfFlowAnswer({
+        messages,
+        latestUserText,
+        customerLanguage,
+        respondContactProfile,
+        booking: { ...existingBooking, bookingTeam, details, pendingField: 'preferredTime' },
+        modelIntent,
+      })
+
+      return {
+        text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPreferredTime')}`,
+        booking: { ...existingBooking, bookingTeam, details, pendingField: 'preferredTime' },
+      }
+    }
+
+    const preferredTime = extractPreferredTimeText(latestUserText) || latestUserText.trim()
+    const nextDetails = { ...details, preferredTime }
+
+    return await offerSoonestRespondSlot({
+      booking: buildBookingWithExcludedOptions({ ...existingBooking, bookingTeam }),
+      details: nextDetails,
+      customerLanguage,
+      preferredTime,
+      closest: true,
+    })
+  }
+
+  if (acceptedSlotClaimLost && existingBooking.offeredOption) {
+    return await recoverLostAcceptedSlotClaim({
+      booking: { ...existingBooking, bookingTeam },
+      details,
+      customerLanguage,
+    })
+  }
+
+  if (existingBooking.pendingField === 'phone') {
+    const activeOption = existingBooking.offeredOption || existingBooking.options?.[0]
+    const latestMessageChangesAvailability =
+      Boolean(latestSignals.preferredTime) ||
+      extractAvailabilityPreference(latestUserText).hasPreference
+
+    if (
+      (existingBooking.offeredOption || existingBooking.options?.length) &&
+      latestMessageChangesAvailability &&
+      latestPreferredTime
+    ) {
+      const nextDetails = applyAvailabilityConstraintFromPreferredTime({
+        ...details,
+        ...latestSignals,
+        preferredTime: latestPreferredTime,
+      })
+      const contextualDetails = applyContextualLaterCutoff({
+        details: nextDetails,
+        latestUserText,
+        currentOption: activeOption,
+      })
+
+      return await offerReplacementRespondSlot({
+        currentBooking: { ...existingBooking, bookingTeam, details },
+        booking: buildBookingWithExcludedOptions({ ...existingBooking, bookingTeam, pendingField: '' }),
+        details: contextualDetails,
+        customerLanguage,
+        preferredTime: contextualDetails.preferredTime,
+        closest: true,
+      })
+    }
+
+    const extractedPhone = latestSignals.phone || extractPhoneNumber(latestUserText)
+    const phone =
+      !shouldUseNewClientBookingFlow(respondContactProfile) || isUsCountryCodePhone(extractedPhone)
+        ? normalizeUsPhoneNumber(extractedPhone) || extractedPhone
+        : ''
+    const nextDetails = phone ? { ...details, phone, phoneConfirmed: true } : details
+    const phoneCopyKey = shouldUseNewClientBookingFlow(respondContactProfile) ? 'askUsPhone' : 'askPhone'
+
+    if (!nextDetails.phone) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, phoneCopyKey)}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        }
+      }
+
+      return prependOutOfFlowAnswerIfNeeded({
+        response: {
+          text: bookingCopy(customerLanguage, phoneCopyKey),
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        },
+        latestUserText,
+        customerLanguage,
+        booking: existingBooking,
+        details: nextDetails,
+      })
+    }
+
+    if (!activeOption) {
+      return await offerSoonestRespondSlot({
+        booking: { ...existingBooking, bookingTeam, pendingField: '' },
+        details: nextDetails,
+        customerLanguage,
+        preferredTime: nextDetails.preferredTime,
+        closest: Boolean(nextDetails.preferredTime),
+      })
+    }
+
+    if (!hasBookableRespondCustomerName(nextDetails, respondContactProfile)) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, activeOption ? 'askName' : 'askNameBeforeSlot')}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, activeOption ? 'askName' : 'askNameBeforeSlot'),
+        booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+      }
+    }
+
+    return await bookAcceptedRespondSlot({
+      booking: { ...existingBooking, bookingTeam, pendingField: '', offeredOption: activeOption },
+      details: nextDetails,
+      customerLanguage,
+      respondContactProfile,
+    }).catch((error) =>
+      buildRespondBookingFailure(
+        { ...existingBooking, bookingTeam, pendingField: '', offeredOption: activeOption },
+        nextDetails,
+        customerLanguage,
+        error,
+      ),
+    )
+  }
+
+  if (existingBooking.pendingField === 'name') {
+    const activeOption = existingBooking.offeredOption || existingBooking.options?.[0]
+    const isOutOfFlowQuestion = shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)
+    const nameDetails = mergeCustomerNameReply(details, latestUserText)
+    const nextDetails = mergeNonEmptyDetails(
+      details,
+      nameDetails,
+    )
+
+    // A customer can change the requested time while also providing a name
+    // (for example, "8:30am, mi nombre es Jenny"). Honor the scheduling
+    // change first and retain any usable name details for the next step.
+    if (activeOption && latestSignals.preferredTime) {
+      return await offerSoonestRespondSlot({
+        booking: buildBookingWithRejectedAvailability({
+          booking: { ...existingBooking, bookingTeam, pendingField: '' },
+          latestUserText,
+          details: nextDetails,
+        }),
+        details: nextDetails,
+        customerLanguage,
+        preferredTime: nextDetails.preferredTime,
+        closest: true,
+      })
+    }
+
+    if (!hasBookableRespondCustomerName(nextDetails, respondContactProfile)) {
+      if (isOutOfFlowQuestion) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askName')}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, 'askName'),
+        booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'name' },
+      }
+    }
+
+    if (!nextDetails.phone) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPhone')}`,
+          booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, 'askPhone'),
+        booking: { ...existingBooking, bookingTeam, details: nextDetails, pendingField: 'phone' },
+      }
+    }
+
+    if (!activeOption) {
+      return await offerSoonestRespondSlot({
+        booking: { ...existingBooking, bookingTeam, pendingField: '' },
+        details: nextDetails,
+        customerLanguage,
+        preferredTime: nextDetails.preferredTime,
+        closest: Boolean(nextDetails.preferredTime),
+      })
+    }
+
+    return await bookAcceptedRespondSlot({
+      booking: { ...existingBooking, bookingTeam, offeredOption: activeOption },
+      details: nextDetails,
+      customerLanguage,
+      respondContactProfile,
+    }).catch((error) =>
+      buildRespondBookingFailure(
+        { ...existingBooking, bookingTeam, offeredOption: activeOption },
+        nextDetails,
+        customerLanguage,
+        error,
+      ),
+    )
+  }
+
+  const activeOfferedOption = existingBooking.offeredOption
+  const activeOfferedTime = activeOfferedOption
+    ? getOptionCustomerTime(activeOfferedOption, details.state)
+    : null
+  const confirmedOfferedOption =
+    activeOfferedOption &&
+      activeOfferedTime &&
+      confirmsOfferedSlotTime(latestUserText, activeOfferedTime.hour, activeOfferedTime.minute)
+      ? activeOfferedOption
+      : null
+  const selectedOption =
+    confirmedOfferedOption ||
+    pickRespondAvailabilityOption(latestUserText, existingBooking.options, details.state) ||
+    pickRespondAvailabilityOption(latestUserText, existingBooking.excludedOptions, details.state)
+  const hasActiveSlotOffer = Boolean(existingBooking.offeredOption || existingBooking.options?.length)
+
+  // A state clarification changes only how the same instant is displayed. It
+  // must not reject the active option or fetch a different appointment.
+  if (hasActiveSlotOffer && latestSignals.state && !selectedOption) {
+    const option = existingBooking.offeredOption || existingBooking.options?.[0]
+    const nextDetails = { ...details, state: latestSignals.state }
+
+    return {
+      text: bookingCopy(customerLanguage, 'reofferSlot', {
+        slot: formatCustomerStateSlot(option.startTime, nextDetails.state, option.timezone, customerLanguage),
+      }),
+      booking: {
+        ...existingBooking,
+        bookingTeam,
+        details: nextDetails,
+        offeredOption: option,
+        options: [],
+      },
+    }
+  }
+
+  if (hasActiveSlotOffer && !selectedOption && isGreetingOnly(latestUserText)) {
+    const option = existingBooking.offeredOption || existingBooking.options?.[0]
+
+    return {
+      text: `${acknowledgeGreeting(customerLanguage)}\n\n${bookingCopy(customerLanguage, 'reofferSlot', {
+        slot: formatCustomerStateSlot(option.startTime, details.state, option.timezone, customerLanguage),
+      })}`,
+      booking: {
+        ...existingBooking,
+        bookingTeam,
+        details,
+        offeredOption: option,
+        options: [],
+      },
+    }
+  }
+
+  if (
+    hasActiveSlotOffer &&
+    !selectedOption &&
+    !isSlotRejection(latestUserText) &&
+    !latestSignals.preferredTime &&
+    !extractAvailabilityPreference(latestUserText).hasPreference &&
+    shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)
+  ) {
+    return await buildOutOfFlowAnswerWithBookingContext({
+      messages,
+      latestUserText,
+      customerLanguage,
+      booking: existingBooking,
+      details,
+      respondContactProfile,
+      modelIntent,
+    })
+  }
+
+  if (
+    !isActiveBookingContinuation(existingBooking, latestUserText) &&
+    !isBookingFlowSignal(latestUserText) &&
+    !latestSignals.state &&
+    !latestSignals.desiredTreatment &&
+    !latestSignals.preferredTime &&
+    !latestSignals.phone
+  ) {
+    return null
+  }
+
+  if (hasActiveSlotOffer && !selectedOption && isSlotRejection(latestUserText)) {
+    const activeOption = existingBooking.offeredOption || existingBooking.options?.[0]
+    const nextBooking = buildBookingWithRejectedAvailability({
+      booking: { ...existingBooking, bookingTeam },
+      latestUserText,
+      details,
+    })
+
+    if (isOutOfFlowInfoQuestion(latestUserText)) {
+      const answer = getOutOfFlowAnswer(latestUserText, customerLanguage)
+
+      return {
+        text: answer || bookingCopy(customerLanguage, 'checking'),
+        booking: { ...nextBooking, details },
+      }
+    }
+
+    const extractedPreferredTime = extractPreferredTimeText(latestUserText)
+    const preferredTime = getPreferredTimeAfterSlotRejection({
+      details,
+      latestSignals,
+      latestUserText,
+      extractedPreferredTime,
+    })
+    const nextDetails = preferredTime
+      ? applyAvailabilityConstraintFromPreferredTime({ ...details, preferredTime })
+      : details
+    const contextualDetails = applyContextualLaterCutoff({
+      details: nextDetails,
+      latestUserText,
+      currentOption: activeOption,
+    })
+    const minimumStartTime = getMinimumStartAfterSlotRejection(
+      latestUserText,
+      activeOption?.startTime,
+      getLaterSlotDelayMs(getCustomerStateHour(activeOption?.startTime, details.state, activeOption?.timezone)),
+    )
+
+    return await offerSoonestRespondSlot({
+      booking: nextBooking,
+      details: minimumStartTime ? { ...contextualDetails, minimumStartTime } : contextualDetails,
+      customerLanguage,
+      preferredTime,
+      closest: Boolean(preferredTime),
+      offerCopyKey: preferredTime ? '' : 'offerAlternativeSlot',
+      latestSameDayAfter: getCustomerStateHour(activeOption?.startTime, details.state, activeOption?.timezone) >= 16
+        ? activeOption.startTime
+        : 0,
+    })
+  }
+
+  if (hasActiveSlotOffer && !selectedOption && isConversationDeferralReply(latestUserText)) {
+    return {
+      text: bookingCopy(customerLanguage, 'bookingPaused'),
+      booking: existingBooking,
+    }
+  }
+
+  if (hasActiveSlotOffer && !selectedOption && latestSignals.preferredTime) {
+    const currentOption = existingBooking.offeredOption || existingBooking.options?.[0]
+    const nextDetails = applyContextualLaterCutoff({
+      details: {
+        ...details,
+        ...latestSignals,
+        ...(latestPreferredTime ? { preferredTime: latestPreferredTime } : {}),
+        ...(latestSignals.direction === 'earlier' && currentOption
+          ? { latestStartTime: currentOption.startTime }
+          : {}),
+      },
+      latestUserText,
+      currentOption,
+    })
+
+    return await offerSoonestRespondSlot({
+      booking: buildBookingWithRejectedAvailability({
+        booking: { ...existingBooking, bookingTeam },
+        latestUserText,
+        details,
+      }),
+      details: nextDetails,
+      customerLanguage,
+      preferredTime: nextDetails.preferredTime,
+      closest: true,
+    })
+  }
+
+  // When the user rejects a single offered slot, offer more alternatives instead of asking for preferred time
+  if (existingBooking.offeredOption && isNegativeReply(latestUserText)) {
+    const activeOption = existingBooking.offeredOption
+    const extractedPreferredTime = extractPreferredTimeText(latestUserText)
+    const preferredTime = getPreferredTimeAfterSlotRejection({
+      details,
+      latestSignals,
+      latestUserText,
+      extractedPreferredTime,
+    })
+    const nextDetails = preferredTime
+      ? applyAvailabilityConstraintFromPreferredTime({ ...details, preferredTime })
+      : details
+    const minimumStartTime = getMinimumStartAfterSlotRejection(
+      latestUserText,
+      activeOption.startTime,
+      getLaterSlotDelayMs(getCustomerStateHour(activeOption.startTime, details.state, activeOption.timezone)),
+    )
+
+    return await offerSoonestRespondSlot({
+      booking: buildBookingWithRejectedAvailability({
+        booking: { ...existingBooking, bookingTeam },
+        latestUserText,
+        details,
+      }),
+      details: minimumStartTime ? { ...nextDetails, minimumStartTime } : nextDetails,
+      customerLanguage,
+      preferredTime,
+      closest: Boolean(preferredTime),
+      offerCopyKey: preferredTime ? '' : 'offerAlternativeSlot',
+      latestSameDayAfter: getCustomerStateHour(activeOption.startTime, details.state, activeOption.timezone) >= 16
+        ? activeOption.startTime
+        : 0,
+    })
+  }
+
+  // When user rejects from a list, offer a fresh set of alternatives
+  if (existingBooking.options?.length > 1 && isNegativeReply(latestUserText)) {
+    const activeOption = existingBooking.options[0]
+    const extractedPreferredTime = extractPreferredTimeText(latestUserText)
+    const preferredTime = getPreferredTimeAfterSlotRejection({
+      details,
+      latestSignals,
+      latestUserText,
+      extractedPreferredTime,
+    })
+    const nextDetails = preferredTime
+      ? applyAvailabilityConstraintFromPreferredTime({ ...details, preferredTime })
+      : details
+    const minimumStartTime = getMinimumStartAfterSlotRejection(
+      latestUserText,
+      activeOption?.startTime,
+      getLaterSlotDelayMs(getCustomerStateHour(activeOption?.startTime, details.state, activeOption?.timezone)),
+    )
+
+    return await offerSoonestRespondSlot({
+      booking: buildBookingWithRejectedAvailability({
+        booking: { ...existingBooking, bookingTeam },
+        latestUserText,
+        details,
+      }),
+      details: minimumStartTime ? { ...nextDetails, minimumStartTime } : nextDetails,
+      customerLanguage,
+      preferredTime,
+      closest: Boolean(preferredTime),
+      offerCopyKey: preferredTime ? '' : 'offerAlternativeSlot',
+      latestSameDayAfter: getCustomerStateHour(activeOption?.startTime, details.state, activeOption?.timezone) >= 16
+        ? activeOption.startTime
+        : 0,
+    })
+  }
+
+  if (existingBooking.options?.length > 1 && !selectedOption) {
+    return {
+      text: bookingCopy(customerLanguage, 'askChooseOption'),
+      booking: existingBooking,
+    }
+  }
+
+  if (
+    existingBooking.teamChanged &&
+    hasActiveSlotOffer &&
+    (selectedOption || (existingBooking.offeredOption && isSlotAffirmation(latestUserText, latestSignals)))
+  ) {
+    return await offerSoonestRespondSlot({
+      booking: buildBookingWithExcludedOptions({ ...existingBooking, bookingTeam, teamChanged: false }),
+      details,
+      customerLanguage,
+      preferredTime: latestSignals.preferredTime || details.preferredTime,
+      closest: true,
+    })
+  }
+
+  // When the user confirms a slot, new clients provide their name. Client and
+  // Evaluation Scheduled contacts use the Customer Service booking flow.
+  if (selectedOption || (existingBooking.offeredOption && isSlotAffirmation(latestUserText, latestSignals))) {
+    const option = selectedOption || existingBooking.offeredOption
+    const acceptedBookingBase = { ...existingBooking, bookingTeam, details, offeredOption: option, options: [] }
+    const acceptedClaim = await acquireSlotClaim({
+      option,
+      contactId: existingBooking.contactId,
+    }).catch((error) => {
+      console.warn(`Unable to claim accepted slot; continuing with final availability verification: ${error.message}`)
+      return null
+    })
+
+    if (acceptedClaim && !acceptedClaim.acquired) {
+      return await recoverLostAcceptedSlotClaim({
+        booking: acceptedBookingBase,
+        details,
+        customerLanguage,
+      })
+    }
+
+    const acceptedBooking = {
+      ...acceptedBookingBase,
+      ...(acceptedClaim
+        ? { slotClaim: buildPersistedSlotClaim(acceptedClaim, existingBooking.contactId) }
+        : { slotClaim: null }),
+    }
+
+    if (!details.phone) {
+      const phoneCopyKey = shouldUseNewClientBookingFlow(respondContactProfile) ? 'askUsPhone' : 'askPhone'
+
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...acceptedBooking, pendingField: 'phone' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, phoneCopyKey)}`,
+          booking: { ...acceptedBooking, pendingField: 'phone' },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, phoneCopyKey),
+        booking: { ...acceptedBooking, pendingField: 'phone' },
+      }
+    }
+
+    if (!hasBookableRespondCustomerName(details, respondContactProfile)) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...acceptedBooking, pendingField: 'name' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askName')}`,
+          booking: {
+            ...acceptedBooking,
+            pendingField: 'name',
+          },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, 'askName'),
+        booking: {
+          ...acceptedBooking,
+          pendingField: 'name',
+        },
+      }
+    }
+
+    if (!details.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+      if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+        const answer = await generateBookingOutOfFlowAnswer({
+          messages,
+          latestUserText,
+          customerLanguage,
+          respondContactProfile,
+          booking: { ...acceptedBooking, pendingField: 'phone' },
+          modelIntent,
+        })
+
+        return {
+          text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPhone')}`,
+          booking: {
+            ...acceptedBooking,
+            pendingField: 'phone',
+          },
+        }
+      }
+
+      return {
+        text: bookingCopy(customerLanguage, 'askPhone'),
+        booking: {
+          ...acceptedBooking,
+          pendingField: 'phone',
+        },
+      }
+    }
+
+    return await bookAcceptedRespondSlot({
+      booking: acceptedBooking,
+      details,
+      customerLanguage,
+      respondContactProfile,
+    }).catch((error) =>
+      buildRespondBookingFailure(
+        acceptedBooking,
+        details,
+        customerLanguage,
+        error,
+      ),
+    )
+  }
+
+  const hasBookingSignal =
+    existingBooking.offeredOption ||
+    existingBooking.pendingField ||
+    isBookingRequest(latestUserText) ||
+    isBookingFlowSignal(latestUserText) ||
+    Boolean(latestSignals.state || latestSignals.desiredTreatment || latestSignals.preferredTime) ||
+    Boolean(details.state && details.desiredTreatment)
+
+  if (!hasBookingSignal) {
+    return null
+  }
+
+  if (shouldUseOutOfStatePrescribedTemplate(details)) {
+    return {
+      text: shouldUseRepeatOutOfStateTemplate(existingBooking, details)
+        ? outOfStatePrescribedRepeatTemplate(customerLanguage)
+        : outOfStatePrescribedTemplate(customerLanguage),
+      booking: {
+        ...existingBooking,
+        bookingTeam,
+        details,
+        pendingField: 'state',
+        outOfStateNotified: true,
+      },
+    }
+  }
+
+  if (!details.state) {
+    if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+      const answer = await generatePendingStateOutOfFlowAnswer({
+        messages,
+        latestUserText,
+        customerLanguage,
+        respondContactProfile,
+        booking: { ...existingBooking, bookingTeam, details: { ...details, state: '' }, pendingField: 'state' },
+        modelIntent,
+      })
+
+      return {
+        text: buildPendingStateOutOfFlowReply(answer, customerLanguage),
+        booking: { ...existingBooking, bookingTeam, details: { ...details, state: '' }, pendingField: 'state' },
+      }
+    }
+
+    return {
+      text: bookingCopy(customerLanguage, 'askState'),
+      booking: { ...existingBooking, bookingTeam, details, pendingField: 'state' },
+    }
+  }
+
+  if (!details.phone && !shouldUseNewClientBookingFlow(respondContactProfile)) {
+    if (shouldAnswerBeforeReturningToBooking(latestUserText, messages, modelIntent)) {
+      const answer = await generateBookingOutOfFlowAnswer({
+        messages,
+        latestUserText,
+        customerLanguage,
+        respondContactProfile,
+        booking: { ...existingBooking, bookingTeam, details, pendingField: 'phone' },
+        modelIntent,
+      })
+
+      return {
+        text: `${stripBookingPromptFromGeneratedAnswer(answer)}\n\n${bookingCopy(customerLanguage, 'askPhone')}`,
+        booking: { ...existingBooking, bookingTeam, details, pendingField: 'phone' },
+      }
+    }
+
+    return prependOutOfFlowAnswerIfNeeded({
+      response: {
+        text: bookingCopy(customerLanguage, 'askPhone'),
+        booking: { ...existingBooking, bookingTeam, details, pendingField: 'phone' },
+      },
+      latestUserText,
+      customerLanguage,
+      booking: existingBooking,
+      details,
+    })
+  }
+
+  if (existingBooking.offeredOption && !isNegativeReply(latestUserText)) {
+    return null
+  }
+
+  // Offer the first available slot immediately — do not ask for preferred time
+  return await offerSoonestRespondSlot({
+    booking: { ...existingBooking, bookingTeam },
+    details,
+    customerLanguage,
+    preferredTime: latestSignals.preferredTime || details.preferredTime,
+  })
+}
+
+function isUnambiguouslyGeneralMedicationQuestion(content) {
+  const normalized = normalizeSearchText(content)
+  const explicitThirdParty = /\b(client|patient|customer|cliente|paciente|she|he|they|ella|ellos|ellas|ele|ela|celebrity|public figure|celebridad|figura publica)\b/.test(normalized)
+
+  return (
+    isGeneralProductOrMedicationClarification(content) &&
+    !explicitThirdParty &&
+    !hasExplicitNamedPersonMedicationQuestion(content)
+  )
+}
+
+async function offerSoonestRespondSlot({
+  booking,
+  details,
+  customerLanguage,
+  preferredTime = details.preferredTime,
+  closest = false,
+  offerCopyKey = '',
+  forceSingleSlot = false,
+  latestSameDayAfter = 0,
+}) {
+  booking = await releasePersistedSlotClaim(booking)
+  await recordBookingFunnelEvent({
+    contactId: booking.contactId,
+    eventType: 'availability_requested',
+    booking,
+    metadata: { preferredTime: String(preferredTime || ''), stageKey: String(preferredTime || 'general') },
+  }).catch((error) => console.warn(error.message))
+  const requestedSunday = isSundayAvailabilityPreference(preferredTime)
+  if (requestedSunday) {
+    preferredTime = replaceSundayWithSaturday(preferredTime)
+    details = { ...details, preferredTime }
+  }
+  details = applyDefaultAvailabilityWindow(details, preferredTime)
+  logRespondRoutingDecision('offer-slot', {
+    bookingTeam: booking.bookingTeam,
+    state: details.state,
+    pendingField: booking.pendingField,
+    closest,
+  })
+  const shouldOfferMultipleSlots = shouldOfferMultipleScheduleOptions({
+    closest,
+    details,
+    preferredTime,
+  })
+  const getAvailability =
+    booking.bookingTeam === 'customer_service'
+      ? getCustomerServiceAvailability
+      : getNewClientAvailability
+  const hasTimeConstraint = hasAvailabilityTimeConstraint(details)
+  const hasExcludedAvailability = hasBookingAvailabilityExclusions(booking)
+  const availabilityLimit =
+    closest || hasTimeConstraint || shouldOfferMultipleSlots || hasExcludedAvailability ? 100 : 1
+  const options = await getAvailability({
+    limit: availabilityLimit,
+    preferredTime,
+    timezone: getStateTimeZone(details.state),
+  })
+  const strictRequestedDay = hasStrictRequestedDay(preferredTime)
+  const timezone = getStateTimeZone(details.state)
+  const parsedPreference = parsePreferredTime(preferredTime, timezone)
+  const searchDiagnostics = {
+    requested: options.length,
+    strictFiltered: 0,
+    relaxedSameDay: 0,
+    nextDayCandidates: 0,
+  }
+  const fallbackOptions =
+    closest && options.length === 0
+      ? await getAvailability({ limit: 100, timezone: getStateTimeZone(details.state) })
+      : []
+  let availableOptions = filterOptionsByAvailabilityPreference(
+    options.length ? options : fallbackOptions,
+    details,
+  )
+  availableOptions = filterPreviouslyOfferedOptions(availableOptions, booking)
+  searchDiagnostics.strictFiltered = availableOptions.length
+
+  // If the requested date has real calendar openings but none survives a
+  // narrow time window, keep the date and offer its closest valid opening.
+  if (
+    strictRequestedDay &&
+    parsedPreference.dateKey &&
+    hasExactClockPreference(preferredTime) &&
+    availableOptions.length === 0 &&
+    options.length > 0
+  ) {
+    availableOptions = filterOptionsByAvailabilityPreference(options, {
+      state: details.state,
+      minimumStartTime: details.minimumStartTime,
+    })
+    availableOptions = filterPreviouslyOfferedOptions(availableOptions, booking)
+    searchDiagnostics.relaxedSameDay = availableOptions.length
+  }
+
+  // If an explicit date has no usable openings at all, advance to the next
+  // real business-hours option instead of ending the booking flow.
+  if (strictRequestedDay && parsedPreference.dateKey && availableOptions.length === 0) {
+    const nextDayOptions = await getAvailability({ limit: 100, timezone })
+    const afterRequestedDate = nextDayOptions.filter((option) =>
+      getCustomerStateDateKey(option.startTime, details.state, option.timezone) > parsedPreference.dateKey,
+    )
+    searchDiagnostics.nextDayCandidates = afterRequestedDate.length
+    availableOptions = filterOptionsByAvailabilityPreference(afterRequestedDate, {
+      ...details,
+      minimumStartTime: undefined,
+      latestStartTime: undefined,
+    })
+    availableOptions = filterPreviouslyOfferedOptions(availableOptions, booking)
+  }
+
+  if ((hasTimeConstraint || hasExcludedAvailability) && availableOptions.length === 0 && !strictRequestedDay) {
+    availableOptions = filterOptionsByAvailabilityPreference(
+      await getAvailability({ limit: 100, timezone: getStateTimeZone(details.state) }),
+      details,
+    )
+    availableOptions = filterPreviouslyOfferedOptions(availableOptions, booking)
+  }
+  let afterHoursFallback = ''
+
+  if (isAfterHoursAvailabilityPreference(details, preferredTime) && availableOptions.length === 0 && !strictRequestedDay) {
+    const relaxedOptions = filterPreviouslyOfferedOptions(
+      filterOptionsByAvailabilityPreference(
+        await getAvailability({ limit: 100, timezone }),
+        {
+          state: details.state,
+          minimumStartTime: details.minimumStartTime,
+        },
+      ),
+      booking,
+    )
+    const nearClosingOptions = relaxedOptions.filter((option) => {
+      const localHour = getCustomerStateHour(option.startTime, details.state, option.timezone)
+      return localHour === 18
+    })
+
+    if (nearClosingOptions.length > 0) {
+      availableOptions = [nearClosingOptions[0]]
+      afterHoursFallback = 'near_closing'
+    } else {
+      const nextMorningPreferredTime = getNextMorningPreferredTime(preferredTime)
+      const nextMorningOptions = await getAvailability({
+        limit: 100,
+        preferredTime: nextMorningPreferredTime,
+        timezone,
+      })
+      const morningOptions = nextMorningOptions.filter((option) => {
+        const localHour = getCustomerStateHour(option.startTime, details.state, option.timezone)
+
+        return localHour != null && localHour < 12
+      })
+
+      availableOptions = filterPreviouslyOfferedOptions(morningOptions.length ? morningOptions : nextMorningOptions, booking)
+      afterHoursFallback = availableOptions.length > 0 ? 'next_morning' : ''
+    }
+  }
+
+  // A narrow preference must never strand the conversation when the calendars
+  // still contain a real opening. Relax only the time window and offer the
+  // next confirmed option as the final fallback.
+  let usedGeneralAvailabilityFallback = false
+  if (availableOptions.length === 0) {
+    const generalOptions = filterOptionsByAvailabilityPreference(
+      await getAvailability({ limit: 100, timezone }),
+      {
+        state: details.state,
+        minimumStartTime: details.minimumStartTime,
+      },
+    )
+    availableOptions = filterPreviouslyOfferedOptions(generalOptions, booking)
+    usedGeneralAvailabilityFallback = availableOptions.length > 0
+  }
+
+  if (latestSameDayAfter && availableOptions.length > 0) {
+    const referenceOption = { startTime: latestSameDayAfter, timezone: availableOptions[0]?.timezone }
+    const referenceDateKey = getOptionCustomerDateKey(referenceOption, details.state)
+    const sameDayOptions = availableOptions.filter((option) =>
+      getOptionCustomerDateKey(option, details.state) === referenceDateKey,
+    )
+
+    if (sameDayOptions.length > 0) {
+      const latestOption = sameDayOptions.reduce((latest, option) =>
+        Number(option.startTime) > Number(latest.startTime) ? option : latest,
+      )
+      availableOptions = [latestOption, ...availableOptions.filter((option) => option !== latestOption)]
+    }
+  }
+
+  const offeredOption = availableOptions[0]
+
+  logRespondRoutingDecision('availability-search', {
+    strictRequestedDay,
+    requestedDateKey: parsedPreference.dateKey,
+    preferredResultCount: searchDiagnostics.requested,
+    strictResultCount: searchDiagnostics.strictFiltered,
+    relaxedSameDayCount: searchDiagnostics.relaxedSameDay,
+    nextDayCandidateCount: searchDiagnostics.nextDayCandidates,
+    finalResultCount: availableOptions.length,
+  })
+
+  if (!offeredOption) {
+    await recordBookingFailureEvent({
+      contactId: booking.contactId,
+      failureType: 'availability_empty',
+      phase: 'availability_search',
+      booking,
+      metadata: {
+        preferredTime: String(preferredTime || ''),
+        state: String(details.state || ''),
+        strictRequestedDay,
+        requestedDateKey: parsedPreference.dateKey || null,
+        searchDiagnostics,
+        excludedOptionCount: Number(booking.excludedOptions?.length || 0),
+        excludedDateCount: Number(booking.excludedDateKeys?.length || 0),
+      },
+    }).catch((error) => console.warn(error.message))
+    return {
+      text: bookingCopy(customerLanguage, 'noAvailability'),
+      booking: { ...booking, details },
+    }
+  }
+
+  await recordBookingFunnelEvent({
+    contactId: booking.contactId,
+    eventType: 'slot_offered',
+    option: offeredOption,
+    booking,
+  }).catch((error) => console.warn(error.message))
+
+  const nextOptions = [offeredOption]
+  const offerKey = afterHoursFallback === 'near_closing'
+    ? 'offerNearClosingSlotAfterHours'
+    : afterHoursFallback === 'next_morning'
+      ? 'offerNextMorningSlotAfterHours'
+    : usedGeneralAvailabilityFallback
+      ? 'offerClosestSlot'
+      : offerCopyKey || getSingleSlotOfferCopyKey({
+    closest,
+    preferredTime,
+    usedFallback: options.length === 0 && fallbackOptions.length > 0,
+  })
+
+  const offerText = nextOptions.length === 1
+      ? bookingCopy(customerLanguage, offerKey, {
+        slot: formatCustomerStateSlot(nextOptions[0].startTime, details.state, nextOptions[0].timezone, customerLanguage),
+      })
+      : bookingCopy(customerLanguage, closest ? (options.length ? 'offerClosestSlots' : 'offerFallbackSlots') : 'offerSlots', {
+        slots: formatNumberedSlots(nextOptions, details.state, customerLanguage),
+      })
+
+  return {
+    text: requestedSunday
+      ? `${bookingCopy(customerLanguage, 'sundayClosed')}\n\n${offerText}`
+      : offerText,
+    booking: {
+      details,
+      bookingTeam: booking.bookingTeam || 'sales',
+      options: nextOptions,
+      offeredOption: nextOptions.length === 1 ? nextOptions[0] : null,
+      pendingField: '',
+      excludedOptions: booking.excludedOptions || [],
+      excludedDateKeys: booking.excludedDateKeys || [],
+    },
+  }
+}
+
+async function offerReplacementRespondSlot({
+  currentBooking,
+  booking,
+  details,
+  customerLanguage,
+  preferredTime,
+  closest = true,
+}) {
+  const replacement = await offerSoonestRespondSlot({
+    booking,
+    details,
+    customerLanguage,
+    preferredTime,
+    closest,
+  })
+
+  if (replacement.booking?.offeredOption || replacement.booking?.options?.length) {
+    return replacement
+  }
+
+  const currentOption =
+    currentBooking?.offeredOption ||
+    currentBooking?.options?.[0]
+
+  if (!currentOption) {
+    return replacement
+  }
+
+  return {
+    text: bookingCopy(customerLanguage, 'noReplacementKeepSlot', {
+      slot: formatCustomerStateSlot(
+        currentOption.startTime,
+        currentBooking.details?.state,
+        currentOption.timezone,
+        customerLanguage,
+      ),
+    }),
+    booking: {
+      ...currentBooking,
+      offeredOption: currentOption,
+      options: [],
+    },
+  }
+}
+
+function isAfterHoursAvailabilityPreference(details = {}, preferredTime = '') {
+  const normalized = normalizeSearchText(preferredTime || details.preferredTime)
+  const earliestHour = Number.isInteger(details.earliestHour)
+    ? details.earliestHour
+    : extractEarliestHourFromPreferredTime(normalized)
+
+  return earliestHour >= 19
+}
+
+function extractEarliestHourFromPreferredTime(normalizedText) {
+  const match = String(normalizedText || '').match(/\bafter\s+(1[0-2]|0?[1-9])\s*(am|pm)?\b/)
+
+  if (!match) {
+    return null
+  }
+
+  return normalizeAvailabilityHour(Number(match[1]), match[2])
+}
+
+function getNextMorningPreferredTime(preferredTime = '') {
+  const datePhrase = extractPreferredDatePhrase(preferredTime)
+
+  if (datePhrase && !/\b(today|hoy|hoje)\b/i.test(datePhrase)) {
+    return `${datePhrase} morning`
+  }
+
+  return 'tomorrow morning'
+}
+
+function hasBookingAvailabilityExclusions(booking = {}) {
+  return Boolean(
+    booking.offeredOption ||
+    booking.options?.length ||
+    booking.excludedOptions?.length ||
+    booking.excludedDateKeys?.length,
+  )
+}
+
+function hasAvailabilityTimeConstraint(details = {}) {
+  return Number.isInteger(details.earliestHour)
+}
+
+function getSingleSlotOfferCopyKey({ closest = false, preferredTime = '', usedFallback = false } = {}) {
+  if (!closest) {
+    return 'offerSlot'
+  }
+
+  if (usedFallback || hasExactClockPreference(preferredTime)) {
+    return 'offerClosestSlot'
+  }
+
+  return hasDayPartPreference(preferredTime) ? 'offerSoonestForDayPart' : 'offerSoonestForDay'
+}
+
+function getPreferredTimeAfterSlotRejection({
+  details = {},
+  latestSignals = {},
+  latestUserText = '',
+  extractedPreferredTime = '',
+} = {}) {
+  const nextRelativeDay = chooseExplicitOrNextAvailabilityPreference(
+    extractedPreferredTime,
+    latestUserText,
+  )
+
+  // An explicit positive alternative (for example, "I can't do today. I can
+  // do Monday") takes priority. With no alternative, advance past a negated
+  // relative day instead of treating that rejected day as the request.
+  if (nextRelativeDay && !extractedPreferredTime) {
+    return nextRelativeDay
+  }
+
+  if (extractedPreferredTime) {
+    return (
+      resolveRespondPreferredTime({
+        existingDetails: details,
+        latestSignals: { ...latestSignals, preferredTime: extractedPreferredTime },
+        latestUserText,
+      }) || extractedPreferredTime
+    )
+  }
+
+  if (isUnavailableTodayReply(latestUserText)) {
+    return 'tomorrow'
+  }
+
+  if (isTooEarlyAvailabilityReply(latestUserText)) {
+    const existingDate = extractPreferredDatePhrase(details.preferredTime)
+    return existingDate ? `${existingDate} afternoon` : 'afternoon'
+  }
+
+  if (isNegativeAvailabilityReply(latestUserText) || isNegatedAvailabilityPreference(latestUserText)) {
+    return ''
+  }
+
+  return (
+    resolveRespondPreferredTime({
+      existingDetails: details,
+      latestSignals: { ...latestSignals, preferredTime: extractedPreferredTime },
+      latestUserText,
+    }) || ''
+  )
+}
+
+function hasExactClockPreference(value) {
+  return /\b(?:1[0-2]|0?[1-9])(?:[:.]\d{2})?\s*(?:am|pm)\b|\b(after|around|about|at|a las|las)\s+(?:1[0-2]|0?[1-9])\b/i.test(
+    String(value || ''),
+  )
+}
+
+function hasDayPartPreference(value) {
+  return /\b(afternoon|evening|morning|tarde|noche|manana|manha|noite)\b/i.test(String(value || ''))
+}
+
+function shouldOfferMultipleScheduleOptions({ closest = false, details = {}, preferredTime = '' } = {}) {
+  if (process.env.RESPOND_SINGLE_SLOT_OFFERS !== 'false') {
+    return false
+  }
+
+  if (closest) {
+    return false
+  }
+
+  if (hasAvailabilityTimeConstraint(details)) {
+    return true
+  }
+
+  const normalized = normalizeSearchText(preferredTime || details.preferredTime)
+
+  if (!normalized) {
+    return false
+  }
+
+  return [
+    /\b(today|tomorrow|next day|the next day|next available day|day after tomorrow)\b/,
+    /\b(hoy|manana|manaña|dia siguiente|proximo dia|pasado manana|pasado manaña)\b/,
+    /\b(hoje|amanha|depois de amanha)\b/,
+    /\b(morning|afternoon|evening|later today|later on today)\b/,
+    /\b(ma[nñ]ana|tarde|noche|manha|manh[aã]|noite)\b/,
+    /\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+\d{1,2}\b/,
+    /\b\d{1,2}(st|nd|rd|th)\b/,
+    /\b\d{1,2}[/-]\d{1,2}\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function filterOptionsByAvailabilityPreference(options = [], details = {}) {
+  return options.filter((option) => {
+    const localHour = getCustomerStateHour(option.startTime, details.state, option.timezone)
+    const localMinutes = getCustomerStateMinutesOfDay(option.startTime, details.state, option.timezone)
+
+    if (localHour == null) return false
+    if (localHour >= 19) return false
+    if (Number.isInteger(details.earliestHour) && localHour < details.earliestHour) return false
+    if (Number.isInteger(details.earliestMinuteOfDay) && localMinutes < details.earliestMinuteOfDay) return false
+    if (Number.isFinite(details.latestHour) && localHour >= details.latestHour) return false
+    if (details.latestStartTime && Number(option.startTime) >= Number(details.latestStartTime)) return false
+    if (details.minimumStartTime && Number(option.startTime) < Number(details.minimumStartTime)) return false
+    return true
+  })
+}
+
+function applyContextualLaterCutoff({
+  details = {},
+  latestUserText = '',
+  currentOption,
+} = {}) {
+  const normalized = normalizeSearchText(latestUserText)
+  const isGenericLaterRequest = /^(?:later|later please|mas tarde|más tarde|mais tarde)[?.!]*$/.test(normalized)
+
+  if (!isGenericLaterRequest || !currentOption?.startTime) {
+    return details
+  }
+
+  const offeredLocalHour = getCustomerStateHour(
+    currentOption.startTime,
+    details.state,
+    currentOption.timezone,
+  )
+  const laterStartTime = Number(currentOption.startTime) + getLaterSlotDelayMs(offeredLocalHour)
+  const laterHour = getCustomerStateHour(
+    laterStartTime,
+    details.state,
+    currentOption.timezone,
+  )
+
+  if (laterHour == null || laterHour < 19) {
+    return {
+      ...details,
+      minimumStartTime: laterStartTime,
+      direction: 'later',
+    }
+  }
+
+  const nextDate = new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: getStateTimeZone(details.state, currentOption.timezone),
+  }).format(Number(currentOption.startTime) + 24 * 60 * 60 * 1000)
+
+  return {
+    ...details,
+    preferredTime: `${nextDate} morning`,
+    earliestHour: 9,
+    dayPart: 'morning',
+    direction: 'later',
+    minimumStartTime: undefined,
+    latestStartTime: undefined,
+  }
+}
+
+function buildBookingWithExcludedOptions(booking = {}) {
+  const excludedOptions = [
+    ...(booking.excludedOptions || []),
+    booking.offeredOption,
+    ...(booking.options || []),
+  ].filter(Boolean)
+
+  return {
+    ...booking,
+    offeredOption: null,
+    options: [],
+    excludedOptions,
+  }
+}
+
+function buildBookingWithRejectedAvailability({ booking = {}, latestUserText = '', details = {} } = {}) {
+  const nextBooking = buildBookingWithExcludedOptions(booking)
+  const rejectedDateKey = getRejectedAvailabilityDateKey(latestUserText, booking, details)
+
+  if (!rejectedDateKey) {
+    return nextBooking
+  }
+
+  return {
+    ...nextBooking,
+    details: {
+      ...(nextBooking.details || {}),
+      ...details,
+    },
+    excludedDateKeys: [
+      ...(nextBooking.excludedDateKeys || []),
+      rejectedDateKey,
+    ].filter(Boolean),
+  }
+}
+
+function filterPreviouslyOfferedOptions(options = [], booking = {}) {
+  const offeredKeys = new Set(
+    [
+      booking.offeredOption,
+      ...(booking.options || []),
+      ...(booking.excludedOptions || []),
+    ]
+      .filter(Boolean)
+      .map(getAvailabilityOptionKey),
+  )
+
+  if (!offeredKeys.size) {
+    return filterExcludedDateOptions(options, booking)
+  }
+
+  return filterExcludedDateOptions(
+    options.filter((option) => !offeredKeys.has(getAvailabilityOptionKey(option))),
+    booking,
+  )
+}
+
+function filterExcludedDateOptions(options = [], booking = {}) {
+  const excludedDateKeys = new Set(booking.excludedDateKeys || [])
+
+  if (!excludedDateKeys.size) {
+    return options
+  }
+
+  return options.filter(
+    (option) => !excludedDateKeys.has(getOptionCustomerDateKey(option, booking.details?.state)),
+  )
+}
+
+function getAvailabilityOptionKey(option = {}) {
+  return String(option.startTime || '')
+}
+
+function prependOutOfFlowAnswerIfNeeded({
+  response,
+  latestUserText,
+  customerLanguage,
+  booking = {},
+  details = {},
+}) {
+  const answer = getOutOfFlowAnswer(latestUserText, customerLanguage)
+
+  if (!answer || !response?.text) {
+    return response
+  }
+
+  return {
+    ...response,
+    text: `${answer}\n\n${response.text}`,
+    booking: {
+      ...(response.booking || booking),
+      details: {
+        ...(response.booking?.details || details),
+      },
+    },
+  }
+}
+
+async function buildOutOfFlowAnswerWithBookingContext({
+  messages = [],
+  latestUserText,
+  customerLanguage,
+  booking = {},
+  details = {},
+  respondContactProfile,
+  modelIntent,
+}) {
+  const answer = isClientTreatmentPrivacyQuestion(latestUserText)
+    ? getOutOfFlowAnswer(latestUserText, customerLanguage)
+    : await generateBookingOutOfFlowAnswer({
+      messages,
+      latestUserText,
+      customerLanguage,
+      respondContactProfile,
+      booking: { ...booking, details },
+      modelIntent,
+    })
+
+  if (!answer) {
+    return null
+  }
+
+  const cleanedAnswer = stripBookingPromptFromGeneratedAnswer(answer)
+  const option = booking.offeredOption || booking.options?.[0]
+
+  if (!option) {
+    return {
+      text: cleanedAnswer || answer,
+      booking: { ...booking, details },
+    }
+  }
+
+  const optionKey = getAvailabilityOptionKey(option)
+  const priorReofferCount =
+    booking.reofferedOptionKey === optionKey ? Number(booking.reofferedOptionCount || 0) : 0
+  const reofferCopyKey = priorReofferCount > 0 ? 'slotBridgeWithoutTime' : 'reofferSlot'
+
+  return {
+    text: `${cleanedAnswer || answer}\n\n${bookingCopy(customerLanguage, reofferCopyKey, {
+      slot: formatCustomerStateSlot(option.startTime, details.state, option.timezone, customerLanguage),
+    })}`,
+    booking: {
+      ...booking,
+      details,
+      offeredOption: option,
+      options: [],
+      reofferedOptionKey: optionKey,
+      reofferedOptionCount: priorReofferCount + 1,
+    },
+  }
+}
+
+function getOutOfFlowAnswer(content, customerLanguage) {
+  const normalized = normalizeSearchText(content)
+  const language = normalizeLanguageName(customerLanguage)
+  const spanish = language === 'Latin American Spanish'
+  const portuguese = language === 'Portuguese'
+
+  if (isTreatmentAcquisitionQuestion(content)) {
+    if (spanish) return 'Para conocer como obtener el tratamiento, primero ofrecemos una llamada de analisis gratuita. Durante la llamada, nuestro especialista te explica todos los planes de tratamiento disponibles, los precios, el proceso y los siguientes pasos segun tu objetivo.'
+    if (portuguese) return 'Para saber como obter o tratamento, primeiro oferecemos uma chamada de analise gratuita. Durante a chamada, nosso especialista explica todos os planos de tratamento disponiveis, os precos, o processo e os proximos passos de acordo com seu objetivo.'
+    return 'To learn how to get the treatment, we first offer a free discovery call. During the call, our specialist explains all available treatment plans, pricing, the process, and the next steps based on your goal.'
+  }
+
+  if (!normalized) {
+    return ''
+  }
+
+  if (isReboundEffectQuestion(content)) {
+    if (spanish) {
+      return 'ℹ️ El medicamento por sí solo no tiene efecto rebote, pero también dependerá de ti mantener hábitos saludables para mantener los resultados a largo plazo. Es importante mantener una dieta equilibrada y practicar actividad física regularmente para maximizar los beneficios del tratamiento.\n\n📲 Para más información, nuestra especialista puede explicarlo todo en la llamada gratuita.'
+    }
+    if (portuguese) {
+      return 'ℹ️ O medicamento por si só não tem efeito rebote, mas manter os resultados a longo prazo também depende de hábitos saudáveis. É importante manter uma alimentação equilibrada e praticar atividade física regularmente para maximizar os benefícios do tratamento.\n\n📲 Para mais informações, nossa especialista pode explicar tudo na chamada gratuita.'
+    }
+    return 'ℹ️ The medication itself does not cause a rebound effect, but maintaining long-term results also depends on keeping healthy habits. A balanced diet and regular physical activity are important to maximize the benefits of treatment.\n\n📲 For more information, our specialist can explain everything during the free call.'
+  }
+
+  if (isPastSupplementUseMention(content)) {
+    return getPastSupplementUseAnswer(language)
+  }
+
+  if (isSupplementProductQuestion(content)) {
+    return getSupplementProductAnswer(customerLanguage, content)
+  }
+
+  if (isOralProductQuestion(content)) {
+    return getOralProductAnswer(customerLanguage)
+  }
+
+  if (isGhkProductQuestion(content)) {
+    return getGhkProductAnswer(customerLanguage)
+  }
+
+  if (hasCallFormatQuestion(content)) {
+    return getCallFormatAnswer(language)
+  }
+
+  if (isInjectionFrequencyQuestion(content)) {
+    return getInjectionFrequencyAnswer(language)
+  }
+
+  if (!isOutOfFlowInfoQuestion(content)) {
+    return ''
+  }
+
+  if (isGeneralMedicationSafetyQuestion(content)) {
+    return getGeneralMedicationSafetyAnswer(customerLanguage)
+  }
+
+  if (isClientTreatmentPrivacyQuestion(content, normalized)) {
+    return getClientPrivacyAnswer(customerLanguage)
+  }
+
+  if (isLocationQuestion(normalized)) {
+    if (spanish) return 'Estamos ubicados en 1700 N Dixie Hwy, Suite 116, Boca Raton, FL 33432. Las consultas son online y, si eres elegible y el tratamiento está disponible en tu estado, enviamos el medicamento directamente a tu dirección.'
+    if (portuguese) return 'Estamos localizados na 1700 N Dixie Hwy, Suite 116, Boca Raton, FL 33432. As consultas são online e, se você for elegível e o tratamento estiver disponível no seu estado, enviamos o medicamento diretamente para o seu endereço.'
+    return 'We are located at 1700 N Dixie Hwy, Suite 116, Boca Raton, FL 33432. Consultations are online and, if you are eligible and treatment is available in your state, we ship the medication directly to your address.'
+  }
+
+  if (/\b(cita|appointment|consulta|llamada|chamada)\b/.test(normalized) && /\b(precios?|cu[aá]nto|cuanto|costs?|prices?|cuesta|cuestan|custa|custam|precos?)\b/.test(normalized)) {
+    if (spanish) return 'La llamada de analisis inicial es completamente gratis. En esa llamada te explican las opciones, precios y siguientes pasos sin compromiso.'
+    if (portuguese) return 'A chamada inicial de analise e completamente gratuita. Nessa chamada explicam as opcoes, precos e proximos passos sem compromisso.'
+    return 'The initial discovery call is completely free. During the call, the specialist explains options, pricing, and next steps with no obligation.'
+  }
+
+  if (hasPriceOrPaymentQuestion(normalized)) {
+    return buildGlp1PricingAnswer(content, customerLanguage)
+  }
+
+  if (/\b(doctor|doctors|provider|providers|doctor name|medico|medicos|doctor|doctores|nombre del doctor|proveedor|proveedores|doutor|medico)\b/.test(normalized)) {
+    if (spanish) return 'En Dharma trabajamos con una red de proveedores licenciados en los estados donde ofrecemos atencion. Despues de que completes el formulario medico, tu caso sera asignado a un medico licenciado en tu estado. Durante la llamada de analisis gratuita, nuestro especialista te explicara las opciones de tratamiento, el proceso y respondera cualquier pregunta que tengas.'
+    if (portuguese) return 'Na Dharma, trabalhamos com uma rede de provedores licenciados nos estados onde oferecemos atendimento. Depois que voce completar o formulario medico, seu caso sera atribuido a um medico licenciado no seu estado. Durante a chamada gratuita de analise, nosso especialista explicara as opcoes de tratamento, o processo e respondera qualquer pergunta que voce tiver.'
+    return 'At Dharma, we work with a network of licensed providers in the states where we offer care. After you complete the medical form, your case will be assigned to a licensed doctor in your state. During the free analysis call, our specialist will explain the treatment options, the process, and answer any questions you have.'
+  }
+
+  if (isMedicalHistoryOrSafetyQuestion(normalized)) {
+    if (spanish) return 'Gracias por compartirlo. Durante la llamada de analisis, nuestro especialista revisara todas tus condiciones medicas y posibles contraindicaciones para asegurarse de que cualquier tratamiento sea seguro y apropiado para ti.'
+    if (portuguese) return 'Obrigado por compartilhar. Durante a chamada de analise, nosso especialista revisara todas as suas condicoes medicas e possiveis contraindicacoes para garantir que qualquer tratamento seja seguro e apropriado para voce.'
+    return 'Thank you for sharing that. During the discovery call, our specialist will review all medical conditions and possible contraindications to make sure any treatment is safe and appropriate for you.'
+  }
+
+  if (isPopularityOrBestSellerQuestion(normalized)) {
+    if (spanish) return 'Lo mas solicitado por nuestros clientes suele ser el apoyo para perdida de peso con GLP-1, como el paquete personalizado de Semaglutide/Tirzepatide, y tambien el acceso a prescripcion de Zepbound. El especialista puede explicarte cual opcion se ajusta mejor a tu meta.'
+    if (portuguese) return 'O mais solicitado pelos nossos clientes costuma ser o apoio para perda de peso com GLP-1, como o pacote personalizado de Semaglutide/Tirzepatide, e tambem o acesso a prescricao de Zepbound. O especialista pode explicar qual opcao combina melhor com seu objetivo.'
+    return 'The most requested option from our clients is usually GLP-1 weight-loss support, such as the personalized Semaglutide/Tirzepatide package, along with Zepbound prescription access. The specialist can explain which option may fit your goal best.'
+  }
+
+  if (isInjectionEffectTimingQuestion(normalized)) {
+    if (spanish) return 'Muchas personas empiezan a notar menos apetito en las primeras semanas, pero el ritmo varia segun cada cuerpo, la dosis y el plan indicado. En la llamada gratuita, el especialista te guia sobre como funciona el tratamiento, que esperar y cuales son los siguientes pasos.'
+    if (portuguese) return 'Muitas pessoas comecam a notar menos apetite nas primeiras semanas, mas o ritmo varia conforme cada corpo, a dose e o plano indicado. Na chamada gratuita, o especialista orienta como o tratamento funciona, o que esperar e quais sao os proximos passos.'
+    return 'Many people start noticing reduced appetite within the first few weeks, but timing varies by body, dose, and treatment plan. During the free call, the specialist guides you through how the treatment works, what to expect, and the next steps.'
+  }
+
+  if (
+    /\b(treatment|program|medication|medicine|injection|semaglutide|tirzepatide|zepbound|glp 1|tratamiento|medicamento|inyeccion|programa|injecao)\b/.test(normalized) ||
+    isProductOrMedicationQuestion(normalized)
+  ) {
+    return getGeneralMedicationOfferingAnswer(customerLanguage)
+  }
+
+  if (spanish) return 'Claro, te explico brevemente: la llamada gratis es para revisar tu meta, responder tus dudas y orientarte sobre las opciones disponibles.'
+  if (portuguese) return 'Claro, explico brevemente: a chamada gratuita serve para revisar seu objetivo, responder suas duvidas e orientar sobre as opcoes disponiveis.'
+  return 'Of course. The free call is to review your goal, answer questions, and guide you through the available options.'
+}
+
+function getGeneralMedicationSafetyAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return '✅ Estos medicamentos pueden ser seguros y efectivos para pacientes elegibles cuando son recetados y supervisados adecuadamente, pero no son apropiados para todas las personas y pueden tener efectos secundarios o contraindicaciones. Nuestro especialista te explicara el proceso durante la llamada y el proveedor determinara si eres elegible. 😊'
+  }
+  if (language === 'Portuguese') {
+    return '✅ Esses medicamentos podem ser seguros e eficazes para pacientes elegiveis quando prescritos e acompanhados adequadamente, mas nao sao indicados para todas as pessoas e podem ter efeitos colaterais ou contraindicacoes. Nosso especialista explicara o processo durante a chamada, e o provedor determinara se voce e elegivel. 😊'
+  }
+  return '✅ These medications can be safe and effective for eligible patients when appropriately prescribed and monitored, but they are not suitable for everyone and can have side effects or contraindications. Our specialist will explain the process during the call, and the provider will determine whether you are eligible. 😊'
+}
+
+function getClientPrivacyAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+  if (language === 'Latin American Spanish') return 'Lo siento, por nuestra politica de privacidad no podemos compartir, confirmar ni insinuar informacion sobre tratamientos de ningun cliente, sin importar quien sea. Con gusto podemos explicarte nuestras opciones de manera general, y un especialista puede orientarte durante la llamada gratuita segun tu meta.'
+  if (language === 'Portuguese') return 'Sinto muito, pela nossa politica de privacidade nao podemos compartilhar, confirmar nem sugerir informacoes sobre tratamentos de nenhum cliente, independentemente de quem seja. Podemos explicar nossas opcoes de forma geral, e um especialista pode orientar voce durante a chamada gratuita conforme seu objetivo.'
+  return 'I am sorry, but in accordance with our privacy policy we cannot share, confirm, or imply treatment information for any client, no matter who they are. I can explain our options generally, and a specialist can guide you during the free discovery call based on your goals.'
+}
+
+function isContextualClientPrivacyFollowUp(latestUserText, messages = []) {
+  const normalized = normalizeSearchText(latestUserText)
+  if (isSupplementProductQuestion(latestUserText)) return false
+  const asksAboutTheirTreatment = /\b(what|which|cual|que|qual)\b[\s\S]{0,40}\b(treatment|medication|medicine|tratamiento|tratamento|medicamento)\b/.test(normalized) ||
+    /\b(treatment|medication|medicine|tratamiento|tratamento|medicamento)\b[\s\S]{0,40}\b(she|he|ella|ela|ele)\b/.test(normalized)
+
+  if (!asksAboutTheirTreatment) return false
+
+  const previousUserMessage = [...messages]
+    .reverse()
+    .filter((message) => message.role === 'user' && message.content !== latestUserText)
+    .at(0)
+
+  return Boolean(previousUserMessage && isClientTreatmentPrivacyQuestion(previousUserMessage.content))
+}
+
+function getGeneralMedicationOfferingAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Ofrecemos inyecciones para perdida de peso, como Semaglutide o Tirzepatide, que ayudan a reducir el apetito y apoyar la perdida de grasa corporal cuando un proveedor determina que son apropiadas para ti. Primero hacemos una llamada gratuita para explicar las opciones y los siguientes pasos.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Oferecemos injecoes para perda de peso, como Semaglutide ou Tirzepatide, que ajudam a reduzir o apetite e apoiar a perda de gordura corporal quando um provedor determina que sao apropriadas para voce. Primeiro fazemos uma chamada gratuita para explicar as opcoes e os proximos passos.'
+  }
+
+  return 'We offer weight-loss injections such as Semaglutide or Tirzepatide, which can help reduce appetite and support body-fat loss when a provider determines they are appropriate for you. First, we do a free call to explain the options and next steps.'
+}
+
+function getPrescribedTreatmentDeclinationAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Entiendo, gracias por aclararlo. No tienes que elegir GLP-1 ni Zepbound. También ofrecemos suplementos y apoyo nutricional. Si quieres, puedo explicarte brevemente esas alternativas según tu objetivo.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Entendo, obrigado por esclarecer. Você não precisa escolher GLP-1 nem Zepbound. Também oferecemos suplementos e apoio nutricional. Se quiser, posso explicar brevemente essas alternativas de acordo com seu objetivo.'
+  }
+
+  return 'I understand, and thank you for clarifying. You do not have to choose GLP-1 or Zepbound. We also offer supplements and nutrition support. If you would like, I can briefly explain those alternatives based on your goal.'
+}
+
+function getTreatmentPackageInclusionsAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Entiendo. Tenemos planes personalizados de GLP-1 desde $235/mes, con distintas duraciones para Semaglutide y Tirzepatide. Lo que incluye cada plan puede variar. Durante la llamada gratuita de análisis, nuestro especialista te explicará los productos, las diferencias entre los planes y las opciones que pueden ajustarse a tu meta.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Entendo. Temos planos personalizados de GLP-1 a partir de $235/mês, com diferentes durações de Semaglutide e Tirzepatide. O conteúdo de cada plano pode variar. Durante a chamada gratuita de análise, nosso especialista explicará os produtos, as diferenças entre os planos e as opções que podem se adequar ao seu objetivo.'
+  }
+
+  return 'I understand. We have personalized GLP-1 plans starting at $235/month, with different Semaglutide and Tirzepatide durations. What is included can vary by plan. During the free discovery call, our specialist will explain the products, the differences between the plans, and the options that may fit your goal.'
+}
+
+function getGhkProductAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Sí, trabajamos con GHK-Cu. Durante la llamada de análisis gratuita, nuestra especialista puede explicarte las opciones disponibles, cómo funcionan y si se ajustan a tus objetivos.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Sim, trabalhamos com GHK-Cu. Durante a chamada de análise gratuita, nossa especialista pode explicar as opções disponíveis, como funcionam e se são adequadas aos seus objetivos.'
+  }
+
+  return 'Yes, we work with GHK-Cu. During the free discovery call, our specialist can explain the available options, how they work, and whether they fit your goals.'
+}
+
+function getOralProductAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Sí. También ofrecemos suplementos Dharma en cápsulas, como Fat Burner, Berberine y Creatine. Los tratamientos con Semaglutide y Tirzepatide que ofrecemos son inyecciones; nuestra especialista puede explicarte cuál opción se ajusta mejor a tu meta.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Sim. Também oferecemos suplementos Dharma em cápsulas, como Fat Burner, Berberine e Creatine. Os tratamentos com Semaglutide e Tirzepatide que oferecemos são injeções; nossa especialista pode explicar qual opção combina melhor com seu objetivo.'
+  }
+
+  return 'Yes. We also offer Dharma supplements in capsule form, including Fat Burner, Berberine, and Creatine. The Semaglutide and Tirzepatide treatments we offer are injections; our specialist can explain which option best fits your goal.'
+}
+
+function getSupplementProductAnswer(customerLanguage, content = '') {
+  return buildSupplementCatalogAnswer(normalizeLanguageName(customerLanguage), content)
+  /* Legacy fallback retained below for reference; the catalog above is authoritative.
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Claro. Según las instrucciones de nuestros productos: Berberine Plus se toma en dosis de 2 cápsulas antes de la comida principal. MCT Fat Burner se toma en dosis de 2 cápsulas por la mañana y 2 por la noche, de lunes a viernes, descansando sábado y domingo. No excedas la dosis indicada; si estás embarazada, amamantando, tienes una condición médica o tomas medicamentos, consulta primero con un profesional de salud.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Claro. De acordo com as instruções dos nossos produtos: Berberine Plus é tomado em uma dose de 2 cápsulas antes da refeição principal. MCT Fat Burner é tomado em uma dose de 2 cápsulas pela manhã e 2 à noite, de segunda a sexta, com pausa no sábado e domingo. Não exceda a dose indicada; se estiver grávida, amamentando, tiver alguma condição médica ou usar medicamentos, consulte primeiro um profissional de saúde.'
+  }
+
+  return 'Of course. According to our product directions: Berberine Plus is taken as 2 capsules before the main meal. MCT Fat Burner is taken as 2 capsules in the morning and 2 at night, Monday through Friday, with Saturday and Sunday off. Do not exceed the stated dose; if you are pregnant, nursing, have a medical condition, or take medication, consult a healthcare professional first.' */
+}
+
+function isClientTreatmentPrivacyQuestion(contentOrNormalizedText, maybeNormalizedText = '') {
+  const rawText = String(contentOrNormalizedText || '')
+  const normalizedText = maybeNormalizedText || normalizeSearchText(rawText)
+
+  if (isTreatmentAcquisitionQuestion(rawText)) {
+    return false
+  }
+
+  if (isPrescribedTreatmentDeclination(rawText)) {
+    return false
+  }
+
+  if (isGeneralZepboundQuestion(rawText)) {
+    return false
+  }
+
+  if (
+    isTreatmentPackageInclusionsQuestion(rawText) &&
+    !/\b(client|patient|customer|cliente|paciente|she|he|ella|ele|ela|celebrity|celebridad|public figure|figura publica)\b/.test(normalizedText) &&
+    !/\b[A-Z][a-zA-ZÀ-ÿ'-]{2,}\s+[A-Z][a-zA-ZÀ-ÿ'-]{2,}\b/.test(rawText)
+  ) {
+    return false
+  }
+
+  // A concrete named-person question always takes precedence over the general
+  // medication/offering guard, including lowercase or misspelled names.
+  if (hasExplicitNamedPersonMedicationQuestion(rawText)) {
+    return true
+  }
+
+  if (isExplicitThirdPartyMedicationQuestion(rawText)) {
+    return true
+  }
+
+  // General pricing is answerable company information. This check belongs
+  // after the named/specific-person checks so questions about an identifiable
+  // person's treatment remain private, while "el semaglutide" is correctly
+  // understood as the Spanish article "the", not the pronoun "he".
+  if (hasPriceOrPaymentQuestion(normalizedText)) {
+    return false
+  }
+
+  const explicitlyRejectsNamedPersonQuestion =
+    /\b(no|not)\b[\s\S]{0,40}\b(person|persona|client|cliente|patient|paciente|celebrity|celebridad)\b/.test(
+      normalizedText,
+    )
+  const hasExplicitPrivacySubject =
+    /\b(celebrity|celebrities|famous|public figure|famosa|famoso|celebridad|celebridades|figura publica|client|patient|cliente|paciente|she|he|her|his|ella|ellos|ellas|ele|ela)\b/.test(
+      normalizedText,
+    ) || (String(rawText || '').match(/\b[A-Z][a-zA-ZÀ-ÿ'-]{2,}\b/g) || []).length >= 2
+
+  if (
+    isGeneralProductOrMedicationClarification(normalizedText) &&
+    (explicitlyRejectsNamedPersonQuestion || !hasExplicitPrivacySubject)
+  ) {
+    return false
+  }
+
+  return (
+    isNamedPersonTreatmentQuestion(rawText, normalizedText) ||
+    /\b(client|patient|cliente|paciente)\b[\s\S]{0,40}\b(treatment|medication|medicine|program|tratamiento|medicamento|programa|tratamento)\b/.test(
+      normalizedText,
+    ) ||
+    /\b(treatment|medication|medicine|program|tratamiento|medicamento|programa|tratamento)\b[\s\S]{0,40}\b(client|patient|cliente|paciente)\b/.test(
+      normalizedText,
+    ) ||
+    /\b(she|he|they|her|his|ella|ellos|ellas|ele|ela)\b[\s\S]{0,60}\b(semaglutide|tirzepatide|zepbound|glp 1|injection|injections|medication|medicine|treatment|tratamiento|medicamento|inyeccion|inyecciones|tratamento|medicamento|injecao)\b/.test(
+      normalizedText,
+    ) ||
+    /\b(semaglutide|tirzepatide|zepbound|glp 1|injection|injections|medication|medicine|treatment|tratamiento|medicamento|inyeccion|inyecciones|tratamento|medicamento|injecao)\b[\s\S]{0,60}\b(she|he|they|her|his|ella|ellos|ellas|ele|ela)\b/.test(
+      normalizedText,
+    )
+  )
+}
+
+function isProductOrMedicationQuestion(normalizedText) {
+  return [
+    /\b(what|which|what are|tell me|explain)\b[\s\S]{0,60}\b(medication|medications|medicine|medicines|treatment|treatments|injection|injections|product|products|pill|pills|tablet|tablets|capsule|capsules)\b/,
+    /\b(medication|medications|medicine|medicines|treatment|treatments|injection|injections|product|products|pill|pills|tablet|tablets|capsule|capsules)\b/,
+    /\b(que|cual|cuales|dime|explicame)\b[\s\S]{0,60}\b(medicamento|medicamentos|medicina|medicinas|tratamiento|tratamientos|inyeccion|inyecciones|producto|productos|pastilla|pastillas|capsula|capsulas)\b/,
+    /\b(medicamento|medicamentos|medicina|medicinas|tratamiento|tratamientos|inyeccion|inyecciones|producto|productos|pastilla|pastillas|capsula|capsulas)\b/,
+    /\b(o que|qual|quais|explique)\b[\s\S]{0,60}\b(medicamento|medicamentos|tratamento|tratamentos|injecao|injecoes|produto|produtos|comprimido|comprimidos|capsula|capsulas)\b/,
+  ].some((pattern) => pattern.test(normalizedText))
+}
+
+function isNamedPersonTreatmentQuestion(rawText, normalizedText) {
+  const asksAboutClientMedicine =
+    /\b(may i know|can i know|what|which)\b[\s\S]{0,120}\b(medicine|medication|treatment|program|injection)\b[\s\S]{0,120}\b(client|patient)\b/.test(
+      normalizedText,
+    ) ||
+    /\b(client|patient)\b[\s\S]{0,120}\b(medicine|medication|treatment|program|injection)\b/.test(
+      normalizedText,
+    )
+  const hasTreatmentReference =
+    /\b(semaglutide|tirzepatide|zepbound|glp 1|injection|injections|medication|medicine|treatment|program|tratamiento|medicamento|inyeccion|inyecciones|programa|tratamento|injecao|isso|eso|esto|this|that|it)\b/.test(
+      normalizedText,
+    )
+  const asksUse =
+    /\b(did|does|used|use|uses|using|take|takes|took|was that|is that|uso|utilizo|utiliza|usaba|tomo|toma|tomaba|foi isso|usou|usa|tomou)\b/.test(
+      normalizedText,
+    )
+  const hasThirdPersonReference =
+    /\b(she|he|her|him|his|they|them|ella|ellos|ellas|ele|ela)\b/.test(normalizedText) ||
+    /\bél\b/i.test(String(rawText || ''))
+  const capitalizedWords = String(rawText || '').match(/\b[A-Z][a-zA-ZÀ-ÿ'-]{2,}\b/g) || []
+  const hasLikelyName =
+    capitalizedWords.length >= 2 ||
+    /\b(?:did|does|que|fue|foi)\s+[a-zà-ÿ'-]{3,}\s+[a-zà-ÿ'-]{3,}\s+(?:use|uses|used|take|takes|took|uso|utilizo|utiliza|tomo|toma|usou|usa|tomou)\b/.test(
+      normalizedText,
+    ) ||
+    /\b[a-zà-ÿ'-]{3,}\s+[a-zà-ÿ'-]{3,}\s+(?:use|uses|used|take|takes|took|uso|utilizo|utiliza|tomo|toma|usou|usa|tomou)\b/.test(
+      normalizedText,
+    )
+  const asksAboutNamedPersonTreatment =
+    hasTreatmentReference &&
+    hasLikelyName &&
+    /\b(know|learn|tell me|information|info|about|which|what|medication|medicine|treatment|program|injection|saber|informacion|informacion|sobre|cual|que|medicamento|tratamiento|programa|inyeccion|saber|informacao|sobre|qual|tratamento|injecao)\b/.test(
+      normalizedText,
+    )
+
+  return (
+    asksAboutClientMedicine ||
+    asksAboutNamedPersonTreatment ||
+    (asksUse && hasTreatmentReference && (hasThirdPersonReference || hasLikelyName))
+  )
+}
+
+function isMedicalHistoryOrSafetyQuestion(normalizedText) {
+  return [
+    /\b(medical history|medical condition|condition|conditions|contraindication|contraindications|chronic illness|diagnosis|thyroid|thyroid nodules|nodules|pregnant|pregnancy|breastfeeding|side effect|side effects|medication interaction|can i use|can i take|is it safe)\b/,
+    /\b(historial medico|historia medica|condicion|condiciones|contraindicacion|contraindicaciones|enfermedad cronica|diagnostico|tiroides|nodulo|nodulos|embarazada|embarazo|lactancia|efecto secundario|efectos secundarios|interaccion|puedo usar|puedo tomar|es seguro|hipertensa|hipertenso|hipertension|presion alta)\b/,
+    /\b(historico medico|condicao|condicoes|contraindicacao|contraindicacoes|doenca cronica|diagnostico|tireoide|nodulo|nodulos|gravida|gravidez|amamentando|efeito colateral|efeitos colaterais|interacao|posso usar|posso tomar|e seguro)\b/,
+  ].some((pattern) => pattern.test(normalizedText)) || isReboundEffectQuestion(normalizedText)
+}
+
+function isPopularityOrBestSellerQuestion(normalizedText) {
+  return [
+    /\b(best seller|bestseller|best-selling|best treatment|best treatments|best option|best options|most popular|popular|top seller|most requested|clients like|customers like)\b/,
+    /\b(mas vendido|m[aá]s vendido|mas popular|m[aá]s popular|mas solicitado|m[aá]s solicitado|clientes prefieren)\b/,
+    /\b(mais vendido|mais popular|mais solicitado|clientes preferem)\b/,
+  ].some((pattern) => pattern.test(normalizedText))
+}
+
+function isInjectionEffectTimingQuestion(normalizedText) {
+  return [
+    /\b(how long|when|how soon|how fast)\b[\s\S]{0,80}\b(effect|effects|work|working|results|notice|feel|appetite)\b/,
+    /\b(effect|effects|work|working|results|notice|feel|appetite)\b[\s\S]{0,80}\b(how long|when|how soon|how fast)\b/,
+    /\b(cuanto tarda|cu[aá]nto tarda|cuando|cu[aá]ndo|que tan rapido|qu[eé] tan rapido)\b[\s\S]{0,80}\b(efecto|efectos|funciona|resultados|notar|sentir|apetito)\b/,
+    /\b(efecto|efectos|funciona|resultados|notar|sentir|apetito)\b[\s\S]{0,80}\b(cuanto tarda|cu[aá]nto tarda|cuando|cu[aá]ndo|que tan rapido|qu[eé] tan rapido)\b/,
+    /\b(quanto tempo|quando|quao rapido|qu[aã]o rapido)\b[\s\S]{0,80}\b(efeito|efeitos|funciona|resultados|notar|sentir|apetite)\b/,
+    /\b(efeito|efeitos|funciona|resultados|notar|sentir|apetite)\b[\s\S]{0,80}\b(quanto tempo|quando|quao rapido|qu[aã]o rapido)\b/,
+  ].some((pattern) => pattern.test(normalizedText))
+}
+
+function isLocationQuestion(normalizedText) {
+  return [
+    /\b(where|location|located|address|clinic located|based)\b/,
+    /\b(donde|ubicad[ao]s?|direccion|direcci[oó]n|localizad[ao]s?)\b/,
+    /\b(onde|localiza|endereco|endere[cç]o)\b/,
+  ].some((pattern) => pattern.test(normalizedText))
+}
+
+async function bookAcceptedRespondSlot({ booking, details, customerLanguage, respondContactProfile }) {
+  const option = booking.offeredOption || booking.options?.[0]
+
+  if (!option) {
+    return {
+      text: bookingCopy(customerLanguage, 'checking'),
+      booking: { ...booking, details },
+    }
+  }
+
+  await recordBookingFunnelEvent({
+    contactId: booking.contactId,
+    eventType: 'slot_accepted',
+    option,
+    booking,
+  }).catch((error) => console.warn(error.message))
+
+  if (shouldUseNewClientBookingFlow(respondContactProfile) && !isUsCountryCodePhone(details.phone)) {
+    await recordBookingFunnelEvent({ contactId: booking.contactId, eventType: 'phone_requested', option, booking })
+      .catch((error) => console.warn(error.message))
+    return {
+      text: bookingCopy(customerLanguage, 'askUsPhone'),
+      booking: {
+        ...booking,
+        details: { ...details, phone: '', phoneConfirmed: false },
+        offeredOption: option,
+        pendingField: 'phone',
+      },
+    }
+  }
+
+  if (shouldUseNewClientBookingFlow(respondContactProfile) && !hasConfirmedFullName(details)) {
+    await recordBookingFunnelEvent({ contactId: booking.contactId, eventType: 'name_requested', option, booking })
+      .catch((error) => console.warn(error.message))
+    return {
+      text: bookingCopy(customerLanguage, 'askName'),
+      booking: {
+        ...booking,
+        details: {
+          ...details,
+          firstName: '',
+          lastName: '',
+          nameConfirmed: false,
+        },
+        offeredOption: option,
+        pendingField: 'name',
+      },
+    }
+  }
+
+  const selectedBookingTeam = resolveBookingTeamForOption(option, booking.bookingTeam)
+  const bookMeeting =
+    selectedBookingTeam === 'customer_service'
+      ? bookCustomerServiceMeeting
+      : bookPrioritySellerMeeting
+  const reconcileMeeting =
+    selectedBookingTeam === 'customer_service'
+      ? reconcileCustomerServiceMeeting
+      : reconcilePrioritySellerMeeting
+  const customer = buildRespondBookingCustomer(details, customerLanguage)
+  const claimContactId = respondContactProfile?.contactId || customer.email || customer.phone
+  const claim = await acquireSlotClaim({ option, contactId: claimContactId })
+
+  if (!claim.acquired) {
+    const error = new Error('The selected slot is already being booked by another customer.')
+    error.status = 409
+    throw error
+  }
+
+  await recordBookingFunnelEvent({
+    contactId: claimContactId,
+    eventType: 'claim_acquired',
+    option,
+    booking: { ...booking, bookingTeam: selectedBookingTeam },
+  }).catch((error) => console.warn(error.message))
+
+  let booked
+
+  try {
+    await recordBookingFunnelEvent({
+      contactId: claimContactId,
+      eventType: 'booking_submitted',
+      option,
+      booking: { ...booking, bookingTeam: selectedBookingTeam },
+    }).catch((error) => console.warn(error.message))
+    const idempotentResult = await executeIdempotentBooking({
+      contactId: claimContactId,
+      option,
+      reconcile: () => reconcileMeeting({ customer, option }),
+      submit: async () => {
+        const stillAvailable = await isMeetingOptionAvailable(option)
+        if (!stillAvailable) {
+          const error = new Error('The selected slot is no longer available.')
+          error.status = 409
+          throw error
+        }
+        return bookMeeting({ customer, option })
+      },
+    })
+    booked = idempotentResult.booked
+    await recordBookingFunnelEvent({
+      contactId: claimContactId,
+      eventType: 'booking_confirmed',
+      option,
+      booking: { ...booking, bookingTeam: selectedBookingTeam },
+      metadata: { reused: idempotentResult.reused },
+    }).catch((error) => console.warn(error.message))
+    if (idempotentResult.reused || Number(booking.bookingFailureCount || 0) > 0) {
+      await recordBookingFunnelEvent({
+        contactId: claimContactId,
+        eventType: 'customer_recovered',
+        option,
+        booking: { ...booking, bookingTeam: selectedBookingTeam },
+        metadata: { reused: idempotentResult.reused },
+      }).catch((error) => console.warn(error.message))
+    }
+    const downstreamIncomplete = [booked.dealSync, booked.appointmentContactSync, booked.workflowEnrollment]
+      .some((result) => result && result.ok === false)
+    if (downstreamIncomplete) {
+      await enqueueBookingReconciliation({
+        attemptKey: idempotentResult.attemptKey,
+        contactId: claimContactId,
+        payload: { customer, option, bookingTeam: selectedBookingTeam },
+      }).catch((error) => console.warn(error.message))
+    }
+  } finally {
+    await releaseSlotClaim({ slotKey: claim.slotKey, contactId: claimContactId })
+  }
+
+  return {
+    text: await buildBookedMessage({
+      bookingTeam: selectedBookingTeam,
+      option,
+      booked,
+      customer,
+      language: customerLanguage,
+    }),
+    booking: null,
+    postReplyRespondAction: {
+      type: 'booked',
+      booked,
+      option,
+      customer,
+    },
+  }
+}
+
+async function releasePersistedSlotClaim(booking = {}) {
+  const claim = booking.slotClaim
+  if (!claim?.slotKey || !claim?.contactId) {
+    return booking
+  }
+
+  await releaseSlotClaim({ slotKey: claim.slotKey, contactId: claim.contactId })
+  return { ...booking, slotClaim: null }
+}
+
+async function recoverLostAcceptedSlotClaim({ booking, details, customerLanguage }) {
+  const option = booking.offeredOption || booking.options?.[0]
+  await recordBookingFailureEvent({
+    contactId: booking.contactId,
+    failureType: 'slot_claim_conflict',
+    phase: 'slot_acceptance',
+    option,
+    booking,
+    error: new Error('The accepted slot claim is no longer available.'),
+  }).catch((error) => console.warn(error.message))
+
+  const replacement = await offerSoonestRespondSlot({
+    booking: buildBookingWithExcludedOptions(booking),
+    details: Number.isFinite(Number(option?.startTime))
+      ? { ...details, minimumStartTime: Number(option.startTime) + 1 }
+      : details,
+    customerLanguage,
+    preferredTime: details.preferredTime,
+    closest: Boolean(details.preferredTime),
+    offerCopyKey: 'offerAlternativeSlot',
+    forceSingleSlot: true,
+  })
+
+  return replacement?.booking?.offeredOption || replacement?.booking?.options?.length
+    ? { ...replacement, text: `${bookingCopy(customerLanguage, 'slotTaken')}\n\n${replacement.text}` }
+    : replacement
+}
+
+async function buildRespondBookingFailure(booking, details, customerLanguage, error) {
+  console.warn(`Unable to book Respond HubSpot appointment: ${error.message}`)
+  const failureType = classifyBookingFailure(error)
+  await recordBookingFunnelEvent({
+    contactId: booking.contactId,
+    eventType: 'booking_failed',
+    option: booking.offeredOption || booking.options?.[0],
+    booking,
+    metadata: { failureType },
+  }).catch((recordError) => console.warn(recordError.message))
+  await recordBookingFailureEvent({
+    contactId: booking.contactId,
+    failureType,
+    phase: 'booking_submission',
+    option: booking.offeredOption || booking.options?.[0],
+    booking,
+    error,
+  }).catch((recordError) => console.warn(recordError.message))
+  const slotUnavailable = failureType === 'slot_unavailable' || failureType === 'slot_claim_conflict'
+  const invalidPhone =
+    failureType === 'form_validation_rejected' &&
+    /(?:invalid_phone_number|\bphone\b|\btelefono\b|\btelefone\b)/i.test(String(error?.message || error))
+
+  if (invalidPhone) {
+    return {
+      text: bookingCopy(customerLanguage, 'askValidUsPhone'),
+      booking: {
+        ...booking,
+        details: { ...details, phone: '', phoneConfirmed: false },
+        pendingField: 'phone',
+        lastBookingError: error.message,
+        lastBookingFailureType: failureType,
+        bookingFailureCount: Number(booking.bookingFailureCount || 0) + 1,
+      },
+    }
+  }
+
+  if (slotUnavailable) {
+    const unavailableOption = booking.offeredOption || booking.options?.[0]
+    const unavailableStartTime = Number(unavailableOption?.startTime)
+    const replacement = await offerSoonestRespondSlot({
+      booking: buildBookingWithExcludedOptions(booking),
+      details: Number.isFinite(unavailableStartTime)
+        ? { ...details, minimumStartTime: unavailableStartTime + 1 }
+        : details,
+      customerLanguage,
+      preferredTime: details.preferredTime,
+      closest: Boolean(details.preferredTime),
+      offerCopyKey: 'offerAlternativeSlot',
+      forceSingleSlot: true,
+    }).catch((availabilityError) => {
+      console.warn(`Unable to recover from Respond slot conflict: ${availabilityError.message}`)
+      return null
+    })
+
+    if (replacement?.booking?.offeredOption || replacement?.booking?.options?.length) {
+      return {
+        ...replacement,
+        text: `${bookingCopy(customerLanguage, 'slotTaken')}\n\n${replacement.text}`,
+      }
+    }
+  }
+
+  return {
+    text: bookingCopy(customerLanguage, 'bookingFailed'),
+    booking: {
+      ...(slotUnavailable ? buildBookingWithExcludedOptions(booking) : booking),
+      details,
+      lastBookingError: error.message,
+      lastBookingFailureType: failureType,
+      bookingFailureCount: Number(booking.bookingFailureCount || 0) + 1,
+    },
+  }
+}
+
+function shouldUseOutOfStatePrescribedTemplate(details) {
+  return Boolean(
+    details.state &&
+    !isPrescribedTreatmentDeliveryState(details.state) &&
+    !isAlternativeTreatment(details.desiredTreatment),
+  )
+}
+
+function shouldUseRepeatOutOfStateTemplate(booking, details) {
+  return Boolean(
+    booking?.outOfStateNotified &&
+    normalizeSearchText(booking.details?.state) === normalizeSearchText(details.state),
+  )
+}
+
+function isAlternativeTreatment(treatment) {
+  return /\b(nutrition|supplements?|suplementos?)\b/i.test(String(treatment || ''))
+}
+
+const DEFAULT_RESPOND_DESIRED_TREATMENT = 'Weight Loss Injections'
+
+function withDefaultRespondDesiredTreatment(details) {
+  return {
+    ...details,
+    desiredTreatment: details.desiredTreatment || DEFAULT_RESPOND_DESIRED_TREATMENT,
+  }
+}
+
+function outOfStatePrescribedTemplate(language, firstName = '') {
+  const langNorm = normalizeLanguageName(language)
+  const namePrefix = firstName ? `${firstName}, ` : ''
+  const named = (withName, withoutName) => (firstName ? `${namePrefix}${withName}` : withoutName)
+
+  if (langNorm === 'Latin American Spanish') {
+    return [
+      `💛✨ ${named('por el momento no podemos enviar inyecciones de pérdida de peso a su estado😔.', 'Por el momento no podemos enviar inyecciones de pérdida de peso a su estado😔.')}`,
+      'Pero sí podemos ayudarte con nuestra línea de suplementos Dharma, diseñados para apoyar tu proceso de forma natural:',
+      '🔥 *Fat Burner*: acelera el metabolismo, da energía limpia y ayuda a quemar grasa durante el día.',
+      '🟠 *Berberine*: controla antojos, reduce azúcar en sangre y baja la inflamación abdominal.',
+      '💪 *Creatine*: mejora fuerza, tonifica más rápido y acelera la recuperación para verte más fit.',
+      '*Puedes ver todo aquí* 👉 [https://dharmanutritionclinic.com/collections/supplements](https://dharmanutritionclinic.com/collections/supplements)',
+    ].join('\n')
+  }
+
+  if (langNorm === 'Portuguese') {
+    return [
+      `💛✨ ${named('no momento, não podemos enviar injeções de perda de peso para o seu estado😔.', 'No momento, não podemos enviar injeções de perda de peso para o seu estado😔.')}`,
+      'Mas podemos ajudar você com nossa linha de suplementos Dharma, desenvolvida para apoiar seu processo de forma natural:',
+      '🔥 *Fat Burner*: acelera o metabolismo, dá energia limpa e ajuda a queimar gordura durante o dia.',
+      '🟠 *Berberine*: controla desejos, reduz o açúcar no sangue e diminui a inflamação abdominal.',
+      '💪 *Creatine*: melhora a força, tonifica mais rápido e acelera a recuperação para você ficar mais fit.',
+      '*Você pode ver tudo aqui* 👉 [https://dharmanutritionclinic.com/collections/supplements](https://dharmanutritionclinic.com/collections/supplements)',
+    ].join('\n')
+  }
+
+  return [
+    `💛✨ ${named('at the moment, we cannot ship weight loss injections to your state😔.', 'At the moment, we cannot ship weight loss injections to your state😔.')}`,
+    'But we can help you with our Dharma supplement line, designed to support your journey naturally:',
+    '🔥 *Fat Burner*: speeds up metabolism, provides clean energy, and helps burn fat throughout the day.',
+    '🟠 *Berberine*: controls cravings, reduces blood sugar, and lowers abdominal inflammation.',
+    '💪 *Creatine*: improves strength, tones faster, and speeds up recovery so you look more fit.',
+    '*You can view everything here* 👉 [https://dharmanutritionclinic.com/collections/supplements](https://dharmanutritionclinic.com/collections/supplements)',
+  ].join('\n')
+}
+
+function outOfStatePrescribedRepeatTemplate(language, firstName = '') {
+  const langNorm = normalizeLanguageName(language)
+  const namePrefix = firstName ? `${firstName}, ` : ''
+
+  if (langNorm === 'Latin American Spanish') {
+    return `${namePrefix}si, para inyecciones de perdida de peso todavia no podemos enviar a ese estado. Podemos ayudarte con suplementos Dharma o guia nutricional si quieres seguir por esa opcion.`
+  }
+
+  if (langNorm === 'Portuguese') {
+    return `${namePrefix}sim, para injeções de perda de peso ainda não conseguimos enviar para esse estado. Podemos ajudar com suplementos Dharma ou orientação nutricional se quiser seguir por essa opção.`
+  }
+
+  return `${namePrefix}Yes, for weight loss injections we still cannot ship to that location. We can help with Dharma supplements or nutrition guidance if you would like to continue that way.`
+}
+
+function extractRespondBookingDetails(messages) {
+  const userMessages = messages.filter((item) => item.role === 'user').map((item) => item.content || '')
+  const joined = userMessages.join('\n')
+  const latestState = [...userMessages].reverse().map(extractStateName).find(Boolean)
+  const latestTreatment = [...userMessages].reverse().map(extractDesiredTreatmentName).find(Boolean)
+  const latestPreferredTime = [...userMessages].reverse().map(extractPreferredTimeText).find(Boolean)
+  const latestAvailabilityPreference = [...userMessages]
+    .reverse()
+    .map(extractAvailabilityPreference)
+    .find((preference) => preference.hasPreference)
+
+  return Object.fromEntries(
+    Object.entries({
+      state: latestState,
+      desiredTreatment: latestTreatment,
+      preferredTime: latestAvailabilityPreference?.preferredTime || latestPreferredTime,
+      earliestHour: latestAvailabilityPreference?.earliestHour,
+      latestHour: latestAvailabilityPreference?.latestHour,
+      dayPart: latestAvailabilityPreference?.dayPart,
+      direction: latestAvailabilityPreference?.direction,
+      allowBeforeDefaultStart: latestAvailabilityPreference?.allowBeforeDefaultStart,
+      phone: extractPhoneNumber(joined),
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function extractRespondBookingDetailsFromText(content) {
+  const availabilityPreference = extractAvailabilityPreference(content)
+
+  return Object.fromEntries(
+    Object.entries({
+      state: extractStateName(content),
+      desiredTreatment: extractDesiredTreatmentName(content),
+      preferredTime: availabilityPreference.preferredTime || extractPreferredTimeText(content),
+      earliestHour: availabilityPreference.earliestHour,
+      latestHour: availabilityPreference.latestHour,
+      dayPart: availabilityPreference.dayPart,
+      direction: availabilityPreference.direction,
+      allowBeforeDefaultStart: availabilityPreference.allowBeforeDefaultStart,
+      phone: extractPhoneNumber(content),
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function applyNewClientBookingRequirements(details, { existingBooking = {}, messages = [], respondContactProfile = {} } = {}) {
+  if (!shouldUseNewClientBookingFlow(respondContactProfile)) {
+    return details
+  }
+
+  const nextDetails = { ...details }
+  const conversationSignals = extractRespondBookingDetails(messages)
+  const recordedPhone = getRespondContactBookingDetails(respondContactProfile).phone
+  const conversationPhone = conversationSignals.phone
+  const userProvidedPhone = Boolean(
+    (conversationPhone && isUsCountryCodePhone(conversationPhone)) ||
+    (recordedPhone && isUsCountryCodePhone(recordedPhone)) ||
+    (existingBooking.details?.phoneConfirmed && isUsCountryCodePhone(existingBooking.details?.phone)) ||
+    (nextDetails.phoneConfirmed && isUsCountryCodePhone(nextDetails.phone)),
+  )
+  const userProvidedFullName = Boolean(
+    nextDetails.nameConfirmed &&
+    nextDetails.firstName &&
+    nextDetails.lastName,
+  )
+
+  if (!userProvidedPhone) {
+    delete nextDetails.phone
+  } else if (!isUsCountryCodePhone(nextDetails.phone)) {
+    nextDetails.phone = normalizeUsPhoneNumber(
+      isUsCountryCodePhone(conversationPhone) ? conversationPhone : recordedPhone,
+    )
+    nextDetails.phoneConfirmed = true
+  } else if (isUsCountryCodePhone(nextDetails.phone)) {
+    nextDetails.phone = normalizeUsPhoneNumber(nextDetails.phone)
+    nextDetails.phoneConfirmed = true
+  }
+
+  if (!userProvidedFullName) {
+    delete nextDetails.firstName
+    delete nextDetails.lastName
+    delete nextDetails.nameConfirmed
+  }
+
+  return nextDetails
+}
+
+function buildRespondBookingCustomer(details, customerLanguage) {
+  const bookingDetails = withDefaultRespondDesiredTreatment(details)
+
+  return {
+    firstName: bookingDetails.firstName || 'New',
+    lastName: bookingDetails.lastName || 'Lead',
+    email: createDummyEmailFromProvidedPhone(bookingDetails.phone),
+    phone: bookingDetails.phone,
+    preferredLanguage: customerLanguage,
+    desiredTreatment: bookingDetails.desiredTreatment,
+    state: bookingDetails.state,
+  }
+}
+
+function bookingCopy(language, key, values = {}) {
+  const boldSlotKeys = new Set([
+    'offerSlot',
+    'offerAlternativeSlot',
+    'reofferSlot',
+    'offerClosestSlot',
+    'offerSoonestForDay',
+    'offerSoonestForDayPart',
+    'noReplacementKeepSlot',
+  ])
+
+  if (boldSlotKeys.has(key) && values.slot) {
+    values = { ...values, slot: formatWhatsAppBold(values.slot) }
+  }
+
+  const langNorm = normalizeLanguageName(language)
+  const spanish = langNorm === 'Latin American Spanish'
+  const portuguese = langNorm === 'Portuguese'
+  const firstName = String(values.firstName || '').trim()
+  const nameLead = firstName ? `${firstName}, ` : ''
+  const named = (withName, withoutName) => (firstName ? `${nameLead}${withName}` : withoutName)
+
+  function tri(en, es, pt) {
+    if (spanish) return es
+    if (portuguese) return pt
+    return en
+  }
+
+  const copy = {
+    bookingPaused: tri(
+      'Understood. We will leave the appointment pending for now. When you are ready, we can continue from the same scheduling step.',
+      'Entendido. Dejamos la cita pendiente por ahora. Cuando quieras continuar, retomamos desde el mismo paso de la agenda.',
+      'Entendido. Vamos deixar o agendamento pendente por enquanto. Quando quiser continuar, retomamos da mesma etapa.',
+    ),
+    askState: tri(
+      pickRandomItem([
+        '📍 I’d love to help you find out if we ship to your area! What state do you currently live in?',
+        '📍 To check whether treatment is available in your area, which state are you located in?',
+        '📍 Which state do you live in? I’ll check availability for your area.',
+      ]),
+      pickRandomItem([
+        '📍 ¡Me encantaría ayudarte a confirmar si hacemos envíos a tu área! ¿En qué estado vives actualmente?',
+        '📍 Para verificar si el tratamiento está disponible en tu área, ¿en qué estado te encuentras?',
+        '📍 ¿En qué estado vives? Revisaré la disponibilidad para tu área.',
+      ]),
+      pickRandomItem([
+        '📍 Vou adorar ajudar você a confirmar se fazemos entregas na sua região! Em qual estado você mora atualmente?',
+        '📍 Para verificar se o tratamento está disponível na sua região, em qual estado você está?',
+        '📍 Em qual estado você mora? Vou verificar a disponibilidade na sua região.',
+      ]),
+    ),
+    askStateClarification: tri(
+      '📍 I’m sorry, I couldn’t identify the state. Could you please type the full state name one more time?',
+      '📍 Lo siento, no pude identificar el estado. ¿Podrías escribir el nombre completo del estado una vez más?',
+      '📍 Desculpe, não consegui identificar o estado. Pode escrever o nome completo do estado mais uma vez?',
+    ),
+    confirmInferredState: tri(
+      `Are you in ${values.city}, ${values.state}?`,
+      `Estas en ${values.city}, ${values.state}?`,
+      `Voce esta em ${values.city}, ${values.state}?`,
+    ),
+    askStateDifferent: tri(
+      'No problem. Which state do you live in?',
+      'No hay problema. En que estado vives?',
+      'Sem problema. Em qual estado voce mora?',
+    ),
+    clarifyKansasLocation: tri(
+      'Just to confirm, do you mean Kansas City, Missouri, or the state of Kansas?',
+      'Solo para confirmar, te refieres a Kansas City, Missouri, o al estado de Kansas?',
+      'So para confirmar, voce se refere a Kansas City, Missouri, ou ao estado do Kansas?',
+    ),
+    askCityState: tri(
+      `I can help with that. Which state is ${values.city} in?`,
+      `Claro. En que estado esta ${values.city}?`,
+      `Claro. Em qual estado fica ${values.city}?`,
+    ),
+    askPhone: tri(
+      'Perfect 😊 To book the appointment for your free discovery call, please send the best phone number to use for your appointment details. 📲',
+      'Perfecto 😊 Para agendar la cita de tu llamada de analisis gratis, enviame por favor el mejor numero de telefono para los detalles de tu cita. 📲',
+      'Perfeito 😊 Para agendar sua consulta da chamada gratuita de analise, por favor me envie o melhor número de telefone para os detalhes do seu agendamento. 📲',
+    ),
+    askUsPhone: tri(
+      'To finish booking your appointment, could you please share your U.S. phone number? 📲',
+      'Para terminar de agendar tu cita, ¿podrías compartir tu número de teléfono de Estados Unidos? 📲',
+      'Para concluir o agendamento, você poderia enviar seu número de telefone dos Estados Unidos? 📲',
+    ),
+    askValidUsPhone: tri(
+      'I could not validate that phone number. Your selected appointment time is still saved. Please send a valid U.S. phone number so I can finish booking it. 📲',
+      'No pude validar ese número de teléfono. El horario que elegiste sigue guardado. Envíame un número válido de Estados Unidos para terminar de agendar la cita. 📲',
+      'Não consegui validar esse número de telefone. O horário escolhido continua salvo. Envie um número válido dos Estados Unidos para eu concluir o agendamento. 📲',
+    ),
+    askName: tri(
+      'That time works. What full name should I put on the appointment? 📲',
+      'Ese horario funciona. Que nombre completo pongo para la cita? 📲',
+      'Esse horário funciona. Qual nome completo devo colocar no agendamento? 📲',
+    ),
+    askNameBeforeSlot: tri(
+      'Perfect 😊 May I have your full name so I can book your free discovery call? 📲',
+      'Perfecto 😊 Me das tu nombre completo para poder agendar tu llamada de analisis gratis? 📲',
+      'Perfeito 😊 Pode me enviar seu nome completo para eu agendar sua chamada gratuita de analise? 📲',
+    ),
+    offerSlot: tri(
+      `📅 ${named('I have this available time for your free discovery call:', 'I have this available time for your free discovery call:')} ${values.slot}. Does that work for you?`,
+      `${named('tengo este horario disponible para tu llamada gratuita de análisis:', 'Tengo este horario disponible para tu llamada gratuita de análisis:')} ${values.slot}. Te funciona?`,
+      `${named('tenho este horário disponível para sua chamada gratuita de análise:', 'Tenho este horário disponível para sua chamada gratuita de análise:')} ${values.slot}. Funciona para você?`,
+    ),
+    offerAlternativeSlot: tri(
+      `How about ${values.slot}?\n\nDoes that work for you?`,
+      `Que te parece ${values.slot}?\n\nTe funciona?`,
+      `Que tal ${values.slot}?\n\nFunciona para voce?`,
+    ),
+    reofferSlot: tri(
+      `For the free discovery call, I can still use ${values.slot}. Does that work for you?`,
+      `Para la llamada gratuita de analisis, todavia puedo usar ${values.slot}. Te funciona?`,
+      `Para a chamada gratuita de analise, ainda posso usar ${values.slot}. Funciona para voce?`,
+    ),
+    noReplacementKeepSlot: tri(
+      `I do not see another opening that matches that request, so I kept your current time: ${values.slot}. Would you like to keep it or try a different day or time?`,
+      `No veo otro horario que coincida con esa solicitud, asi que mantuve tu horario actual: ${values.slot}. Quieres conservarlo o probar otro dia u hora?`,
+      `Nao vejo outro horario que corresponda a esse pedido, entao mantive seu horario atual: ${values.slot}. Voce quer mante-lo ou tentar outro dia ou horario?`,
+    ),
+    slotBridgeWithoutTime: tri(
+      'When you are ready, tell me if that time works or if you prefer another available option.',
+      'Cuando puedas, dime si ese horario te funciona o si prefieres otra opcion disponible.',
+      'Quando puder, me diga se esse horario funciona ou se prefere outra opcao disponivel.',
+    ),
+    offerSlots: tri(
+      `These are the next available options for your free discovery call:\n${values.slots}\n\nWhich option works best? You can reply with the number or the time.`,
+      `Estos son los proximos horarios disponibles para tu llamada gratuita:\n${values.slots}\n\nCual opcion te funciona mejor? Puedes responder con el numero o la hora.`,
+      `Estes sao os proximos horarios disponiveis para sua chamada gratuita:\n${values.slots}\n\nQual opcao funciona melhor? Voce pode responder com o numero ou o horario.`,
+    ),
+    askPreferredTime: tri(
+      'Of course, no problem. What day and time works best for the call?',
+      'Claro, no hay problema. Que dia y hora te queda mejor para la llamada?',
+      'Claro, sem problema. Que dia e hora funciona melhor para você?',
+    ),
+    offerClosestSlot: tri(
+      `I do not see that exact time, but this is the closest available opening: ${values.slot}. Does that work for you?`,
+      `No veo exactamente ese horario, pero este es el espacio mas cercano disponible: ${values.slot}. Te funciona?`,
+      `Não vejo exatamente esse horário, mas este é o espaço mais próximo disponível: ${values.slot}. Funciona para você?`,
+    ),
+    offerSoonestForDay: tri(
+      `The soonest available time I have for that day is ${values.slot}. Does that work for you?`,
+      `El horario mas pronto disponible que tengo para ese dia es ${values.slot}. Te funciona?`,
+      `O horario mais cedo disponivel que tenho para esse dia e ${values.slot}. Funciona para voce?`,
+    ),
+    offerSoonestForDayPart: tri(
+      `The soonest available time I have for that part of the day is ${values.slot}. Does that work for you?`,
+      `El horario mas pronto disponible que tengo para esa parte del dia es ${values.slot}. Te funciona?`,
+      `O horario mais cedo disponivel que tenho para essa parte do dia e ${values.slot}. Funciona para voce?`,
+    ),
+    offerClosestSlots: tri(
+      `📅 ${named('I do not have that exact time available, but I do have this option:', 'I do not have that exact time available, but I do have this option:')}\n${values.slots}\n\nDoes that work for you?`,
+      `${named('no tengo ese horario exacto disponible, pero tengo esta opcion:', 'No tengo ese horario exacto disponible, pero tengo esta opcion:')}\n${values.slots}\n\nTe funciona?`,
+      `${named('não tenho exatamente esse horário disponível, mas tenho esta opção:', 'Não tenho exatamente esse horário disponível, mas tenho esta opção:')}\n${values.slots}\n\nFunciona para você?`,
+    ),
+    offerAlternativeSlots: tri(
+      `That time does not work. Here are the next available openings:\n${values.slots}\n\nWhich option works best? Please reply with the number.`,
+      `Ese horario no funciona. Estos son los proximos espacios disponibles:\n${values.slots}\n\nCual opcion te funciona mejor? Responde con el numero.`,
+      `Esse horário não funciona. Estes são os próximos horários disponíveis:\n${values.slots}\n\nQual opção funciona melhor? Responda com o número.`,
+    ),
+    offerFallbackSlots: tri(
+      `📅 ${named('I do not have availability for that requested time right now, but I do have this option:', 'I do not have availability for that requested time right now, but I do have this option:')}\n${values.slots}\n\nDoes that work for you?`,
+      `${named('no tengo disponibilidad para ese horario en este momento, pero tengo esta opcion:', 'No tengo disponibilidad para ese horario en este momento, pero tengo esta opcion:')}\n${values.slots}\n\nTe funciona?`,
+      `${named('não tenho disponibilidade para esse horário agora, mas tenho esta opção:', 'Não tenho disponibilidade para esse horário agora, mas tenho esta opção:')}\n${values.slots}\n\nFunciona para você?`,
+    ),
+    offerNextMorningAfterHours: tri(
+      `I do not have availability after 7:00 PM in your time zone. I can offer these next morning options instead:\n${values.slots}\n\nWhich option works best? Please reply with the number.`,
+      `No tengo disponibilidad despues de las 7:00 PM en tu zona horaria. Puedo ofrecerte estas opciones para la siguiente manana:\n${values.slots}\n\nCual opcion te funciona mejor? Responde con el numero.`,
+      `Nao tenho disponibilidade depois das 7:00 PM no seu fuso horario. Posso oferecer estas opcoes para a manha seguinte:\n${values.slots}\n\nQual opcao funciona melhor? Responda com o numero.`,
+    ),
+    offerNextMorningSlotAfterHours: tri(
+      `We cannot book after 7:00 PM in your time zone, but I can offer this confirmed opening on the next available morning: ${values.slot}. Does that work for you?`,
+      `No podemos agendar despues de las 7:00 p.m. en tu zona horaria, pero puedo ofrecerte este espacio confirmado en la proxima manana disponible: ${values.slot}. Te funciona?`,
+      `Nao podemos agendar depois das 7:00 PM no seu fuso horario, mas posso oferecer este horario confirmado na proxima manha disponivel: ${values.slot}. Funciona para voce?`,
+    ),
+    offerNearClosingSlotAfterHours: tri(
+      `Our appointment hours end at 7:00 PM in your time zone, so I cannot offer the requested later time. The closest confirmed evening opening I can offer is ${values.slot}. Does that work for you?`,
+      `Nuestro horario de citas termina a las 7:00 p.m. en tu zona horaria, por eso no puedo ofrecer el horario solicitado mas tarde. El espacio confirmado mas cercano que puedo ofrecerte en la tarde es ${values.slot}. Te funciona?`,
+      `Nosso horario de consultas termina as 7:00 PM no seu fuso horario, por isso nao posso oferecer o horario solicitado mais tarde. O horario confirmado mais proximo que posso oferecer no fim da tarde e ${values.slot}. Funciona para voce?`,
+    ),
+    askChooseOption: tri(
+      'Which option works best? Please reply with the number or the time so I can book it.',
+      'Cual opcion te funciona mejor? Responde con el numero para agendarla.',
+      'Qual opção funciona melhor? Responda com o número para que eu possa agendar.',
+    ),
+    clarifySundayOrName: tri(
+      'Just to clarify: is Domingo your name, or are you requesting an appointment on Sunday?',
+      'Solo para confirmar: Domingo es tu nombre, o estas solicitando una cita el domingo?',
+      'So para confirmar: Domingo e seu nome, ou voce esta pedindo uma consulta no domingo?',
+    ),
+    sundayClosed: tri(
+      'We do not have appointments on Sundays, so I checked Saturday instead.',
+      'No tenemos citas los domingos, asi que revise el sabado como alternativa.',
+      'Nao temos consultas aos domingos, entao verifiquei o sabado como alternativa.',
+    ),
+    booked: tri(
+      `All set, your call is booked for ${values.slot}. The appointment details will be sent to you.`,
+      `Listo, tu llamada quedo agendada para ${values.slot}. Te enviaran los detalles de la cita.`,
+      `Pronto, sua chamada está agendada para ${values.slot}. Os detalhes do agendamento serão enviados para você.`,
+    ),
+    noAvailability: tri(
+      'I could not find a confirmed opening on the available calendars. What other day or time would you like me to check?',
+      'No encontre un espacio confirmado en los calendarios disponibles. Que otro dia u horario quieres que revise?',
+      'Não encontrei um horário confirmado nos calendários disponíveis. Que outro dia ou horário você quer que eu verifique?',
+    ),
+    bookingFailed: tri(
+      'I could not confirm that appointment right now. Your scheduling preference is still saved, and I can check another confirmed opening.',
+      'No pude confirmar esa cita en este momento. Tu preferencia de horario sigue guardada y puedo revisar otro espacio confirmado.',
+      'Não consegui confirmar esse agendamento agora. Sua preferência de horário continua salva e posso verificar outra vaga confirmada.',
+    ),
+    slotTaken: tri(
+      'That time is no longer available, so I checked the calendar again.',
+      'Ese horario ya no esta disponible, asi que revise el calendario nuevamente.',
+      'Esse horario nao esta mais disponivel, entao consultei o calendario novamente.',
+    ),
+    checking: tri(
+      'Give me a moment and I will help with the next available time.',
+      'Dame un momento y te ayudo con el proximo horario disponible.',
+      'Dê-me um momento e vou ajudá-lo com o próximo horário disponível.',
+    ),
+  }
+
+  return copy[key] || ''
+}
+
+function getPendingStateRecoveryText(content, customerLanguage) {
+  const normalized = normalizeSearchText(content)
+  const askState = bookingCopy(customerLanguage, 'askState')
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (isGreetingOnly(content)) {
+    return `${acknowledgeGreeting(customerLanguage)} ${askState}`
+  }
+
+  if (isBookingRequest(content)) {
+    if (language === 'Latin American Spanish') {
+      return `Claro, te ayudo con los horarios. Primero necesito confirmar tu estado para revisar la disponibilidad correcta.\n\n${askState}`
+    }
+
+    if (language === 'Portuguese') {
+      return `Claro, eu te ajudo com os horarios. Primeiro preciso confirmar seu estado para verificar a disponibilidade correta.\n\n${askState}`
+    }
+
+    return `Of course, I can help with available times. First I need to confirm your state so I can check the right availability.\n\n${askState}`
+  }
+
+  if (isGoalOrTreatmentStatement(normalized) || extractDesiredTreatmentName(content)) {
+    if (language === 'Latin American Spanish') {
+      return `Claro, te podemos orientar con las opciones de tratamiento. Para confirmar si hacemos envios a tu estado, dime por favor en que estado vives?`
+    }
+
+    if (language === 'Portuguese') {
+      return `Claro, podemos te orientar com as opcoes de tratamento. Para confirmar se fazemos entregas no seu estado, por favor me diga em que estado voce mora?`
+    }
+
+    return `Of course, we can guide you through the treatment options. To confirm whether we ship to your state, please tell us which state you live in?`
+  }
+
+  return askState
+}
+
+function isNonAttemptPendingStateMessage(content) {
+  return isGreetingOnly(content) || isBookingRequest(content)
+}
+
+function buildUnrecognizedStateAttemptResponse({
+  existingBooking,
+  bookingTeam,
+  details,
+  customerLanguage,
+}) {
+  const result = getUnrecognizedStateAttemptResult(existingBooking.stateClarificationAttempts)
+  const booking = {
+    ...existingBooking,
+    bookingTeam,
+    details,
+    pendingField: 'state',
+    stateClarificationAttempts: result.attempts,
+  }
+
+  if (result.shouldTransfer) {
+    return {
+      text: '',
+      booking,
+      frontDeskTransfer: {
+        type: 'state_location_clarification',
+        reason: 'State remained unrecognized after one clarification attempt.',
+      },
+    }
+  }
+
+  return {
+    text: bookingCopy(customerLanguage, 'askStateClarification'),
+    booking,
+  }
+}
+
+async function generatePendingStateOutOfFlowAnswer({
+  messages,
+  latestUserText,
+  customerLanguage,
+  respondContactProfile,
+  booking,
+  modelIntent,
+}) {
+  if (
+    isClientTreatmentPrivacyQuestion(latestUserText) ||
+    hasCallFormatQuestion(latestUserText)
+  ) {
+    return getOutOfFlowAnswer(latestUserText, customerLanguage)
+  }
+
+  const startedAt = Date.now()
+  const medicationFollowUp = isContextualMedicationFollowUp(latestUserText, messages)
+  const fallbackAnswer = medicationFollowUp
+    ? getMedicationFunctionAnswer(customerLanguage)
+    : getOutOfFlowAnswer(latestUserText, customerLanguage)
+  const ragResult = await buildRagContextResult({
+    agent: RESPOND_AGENT,
+    messages,
+    message: latestUserText,
+    modelIntent,
+  })
+  const memoryContext = await buildMemoryContext({
+    agent: RESPOND_AGENT,
+    messages,
+    message: latestUserText,
+  })
+  const requiresRag = shouldRequireRagForModelAnswer(modelIntent)
+
+  if (requiresRag && ragResult.matchCount === 0) {
+    logModelUsage({
+      callType: 'pending_state_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: 0,
+      ragSourceTypes: ragResult.sourceTypes,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallbackAnswer || getContextualOutOfFlowFallbackAnswer(customerLanguage)
+  }
+
+  const instructions = buildInstructions({
+    agent: RESPOND_AGENT,
+    customerLanguage,
+    instructions: [
+      'The customer has not provided their state yet. Answer the latest customer question directly using retrieved company knowledge and the conversation context.',
+      'Do not ask for phone number, appointment availability, name, or booking confirmation in this answer.',
+      'Do not ask for state, location, shipping availability, or where they live in this answer; the application will append one state question after your answer.',
+      'If the customer asks about a doctor, provider, or who handles the medical review, answer that question first in the customer language. Use this structure: Dharma works with a network of licensed providers in the states where we offer care; after the medical form is completed, the case is assigned to a licensed doctor in the customer state, or their state if no state is known; during the free analysis call, our specialist explains treatment options, the process, and answers questions.',
+      (isGeneralProductOrMedicationClarification(latestUserText) || medicationFollowUp)
+        ? 'The latest message asks about Dharma medications, treatments, products, or offerings generally—not another person. Answer from retrieved knowledge about our Semaglutide and Tirzepatide options. Do not use a privacy disclaimer or transfer language. If the prior reply already gave a basic overview, add concise useful detail or answer the follow-up angle instead of repeating the same wording.'
+        : '',
+      'Do not start with a greeting. Keep it concise but specific enough to actually answer the question.',
+      requiresRag
+        ? 'This is a high-risk or knowledge-dependent topic. Use only retrieved company context and approved policy language. If the retrieved context does not support a specific claim, say the specialist/team can review it instead of guessing.'
+        : '',
+    ].join('\n'),
+  })
+  const input = buildInput({
+    messages,
+    message: latestUserText,
+    customerLanguage,
+    context: [memoryContext, ragResult.context].filter(Boolean).join('\n\n'),
+    respondContactProfile,
+    booking,
+  })
+
+  return createOpenAIResponseText({
+    model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+    instructions,
+    input,
+  }).then((answer) => {
+    const safeAnswer = preventMedicationPrivacyRegression({
+      answer,
+      latestUserText,
+      fallbackAnswer,
+      medicationFollowUp,
+    })
+    const validated = validateControlledModelAnswer(safeAnswer, {
+      fallbackAnswer,
+      customerLanguage,
+      messages,
+      booking,
+      callType: 'pending_state_out_of_flow_answer',
+      modelIntent,
+      ragMatchCount: ragResult.matchCount,
+      durationMs: Date.now() - startedAt,
+    })
+
+    logModelUsage({
+      callType: 'pending_state_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: ragResult.matchCount,
+      ragSourceTypes: ragResult.sourceTypes,
+      guardrailBlocked: validated.blocked,
+      fallbackUsed: validated.fallbackUsed,
+      durationMs: Date.now() - startedAt,
+    })
+    return validated.text
+  }).catch((error) => {
+    console.warn(`Unable to generate pending-state answer: ${error.message}`)
+    logModelUsage({
+      callType: 'pending_state_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: ragResult.matchCount,
+      ragSourceTypes: ragResult.sourceTypes,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallbackAnswer
+  })
+}
+
+async function generateBookingOutOfFlowAnswer({
+  messages,
+  latestUserText,
+  customerLanguage,
+  respondContactProfile,
+  booking,
+  modelIntent,
+}) {
+  if (isClientTreatmentPrivacyQuestion(latestUserText)) {
+    return getOutOfFlowAnswer(latestUserText, customerLanguage)
+  }
+
+  const startedAt = Date.now()
+  const medicationFollowUp = isContextualMedicationFollowUp(latestUserText, messages)
+  const fallbackAnswer =
+    (medicationFollowUp ? getMedicationFunctionAnswer(customerLanguage) : '') ||
+    getOutOfFlowAnswer(latestUserText, customerLanguage) ||
+    getContextualOutOfFlowFallbackAnswer(customerLanguage)
+  const ragResult = await buildRagContextResult({
+    agent: RESPOND_AGENT,
+    messages,
+    message: latestUserText,
+    modelIntent,
+  })
+  const memoryContext = await buildMemoryContext({
+    agent: RESPOND_AGENT,
+    messages,
+    message: latestUserText,
+  })
+  const requiresRag = shouldRequireRagForModelAnswer(modelIntent)
+
+  if (requiresRag && ragResult.matchCount === 0) {
+    logModelUsage({
+      callType: 'booking_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: 0,
+      ragSourceTypes: ragResult.sourceTypes,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallbackAnswer
+  }
+
+  const instructions = buildInstructions({
+    agent: RESPOND_AGENT,
+    customerLanguage,
+    instructions: [
+      'The customer asked a contextual follow-up while a booking step is active. Answer the latest question directly using the recent conversation and retrieved company knowledge.',
+      'If the latest message uses words like "that", "it", "this", "regarding that", or "about that", resolve the reference from the immediately previous customer question and agent answer.',
+      'Do not ask for phone number, name, state, appointment availability, or booking confirmation in this generated answer. The application will append the current booking question after your answer.',
+      'Do not mention the exact offered appointment slot or ask whether the slot works in this generated answer.',
+      'If the customer asks about a doctor, provider, or who handles the medical review, answer that question before returning to the active booking step in the customer language. Use this structure: Dharma works with a network of licensed providers in the states where we offer care; after the medical form is completed, the case is assigned to a licensed doctor in the customer state, or their state if no state is known; during the free analysis call, our specialist explains treatment options, the process, and answers questions.',
+      (isGeneralProductOrMedicationClarification(latestUserText) || medicationFollowUp)
+        ? 'The latest message asks about Dharma medications, treatments, products, or offerings generally—not another person. Answer from retrieved knowledge about our Semaglutide and Tirzepatide options. Do not use a privacy disclaimer or transfer language. If the prior reply already gave a basic overview, add concise useful detail or answer the follow-up angle instead of repeating the same wording.'
+        : '',
+      'Do not start with a greeting. Keep it concise and specific enough to answer the question.',
+      requiresRag
+        ? 'This is a high-risk or knowledge-dependent topic. Use only retrieved company context and approved policy language. If the retrieved context does not support a specific claim, say the specialist/team can review it instead of guessing.'
+        : '',
+    ].join('\n'),
+  })
+  const input = buildInput({
+    messages,
+    message: latestUserText,
+    customerLanguage,
+    context: [memoryContext, ragResult.context].filter(Boolean).join('\n\n'),
+    respondContactProfile,
+    booking,
+  })
+
+  return createOpenAIResponseText({
+    model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+    instructions,
+    input,
+  }).then((answer) => {
+    const safeAnswer = preventMedicationPrivacyRegression({
+      answer,
+      latestUserText,
+      fallbackAnswer,
+      medicationFollowUp,
+    })
+    const validated = validateControlledModelAnswer(safeAnswer, {
+      fallbackAnswer,
+      customerLanguage,
+      messages,
+      booking,
+      callType: 'booking_out_of_flow_answer',
+      modelIntent,
+      ragMatchCount: ragResult.matchCount,
+      durationMs: Date.now() - startedAt,
+    })
+
+    logModelUsage({
+      callType: 'booking_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: ragResult.matchCount,
+      ragSourceTypes: ragResult.sourceTypes,
+      guardrailBlocked: validated.blocked,
+      fallbackUsed: validated.fallbackUsed,
+      durationMs: Date.now() - startedAt,
+    })
+    return validated.text
+  }).catch((error) => {
+    console.warn(`Unable to generate booking out-of-flow answer: ${error.message}`)
+    logModelUsage({
+      callType: 'booking_out_of_flow_answer',
+      ...modelIntent,
+      pendingField: booking?.pendingField,
+      ragMatchCount: ragResult.matchCount,
+      ragSourceTypes: ragResult.sourceTypes,
+      fallbackUsed: true,
+      durationMs: Date.now() - startedAt,
+    })
+    return fallbackAnswer
+  })
+}
+
+function preventMedicationPrivacyRegression({ answer, latestUserText, fallbackAnswer, medicationFollowUp = false }) {
+  if (
+    !medicationFollowUp &&
+    !isGeneralProductOrMedicationClarification(latestUserText) &&
+    !isSupplementProductQuestion(latestUserText)
+  ) {
+    return answer
+  }
+
+  const normalizedAnswer = normalizeSearchText(answer)
+  const containsPrivacyRefusal =
+    /\b(privacy|privacidad|privacidade|cannot share|can not share|no podemos compartir|nao podemos compartilhar|client information|informacion de ningun cliente|informacao de cliente)\b/.test(
+      normalizedAnswer,
+    )
+
+  return containsPrivacyRefusal ? fallbackAnswer : answer
+}
+
+function isContextualMedicationFollowUp(latestUserText, messages = []) {
+  const normalized = normalizeSearchText(latestUserText)
+  const isShortFollowUp = [
+    /\b(what does it do|what do they do|how does it work|how do they work|tell me more|and how)\b/,
+    /\b(que hace|que hacen|como funciona|como funcionan|dime mas|y como)\b/,
+    /\b(o que faz|o que fazem|como funciona|como funcionam|me fale mais|e como)\b/,
+  ].some((pattern) => pattern.test(normalized))
+
+  if (!isShortFollowUp) {
+    return false
+  }
+
+  const recentContext = messages
+    .slice(-6, -1)
+    .map((item) => normalizeSearchText(item.content || ''))
+    .join(' ')
+
+  return /\b(semaglutide|tirzepatide|zepbound|glp 1|medications?|medicines?|treatments?|injections?|medicamentos?|medicinas?|tratamientos?|inyecciones?|tratamentos?|injecoes?)\b/.test(
+    recentContext,
+  )
+}
+
+function getMedicationFunctionAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Semaglutide y Tirzepatide ayudan a reducir el apetito y aumentar la sensacion de saciedad, lo que puede apoyar la perdida de peso y grasa corporal. La opcion apropiada y la elegibilidad se revisan con el proveedor.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Semaglutide e Tirzepatide ajudam a reduzir o apetite e aumentar a sensacao de saciedade, o que pode apoiar a perda de peso e gordura corporal. A opcao adequada e a elegibilidade sao avaliadas pelo provedor.'
+  }
+
+  return 'Semaglutide and Tirzepatide help reduce appetite and increase feelings of fullness, which can support weight and body-fat loss. A provider reviews which option is appropriate and whether you are eligible.'
+}
+
+function getContextualOutOfFlowFallbackAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Si, el especialista puede ayudarte con esa duda durante la llamada gratuita y explicarte que opcion se ajusta mejor a tu meta.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Sim, o especialista pode ajudar com essa duvida durante a chamada gratuita e explicar qual opcao combina melhor com seu objetivo.'
+  }
+
+  return 'Yes, the specialist can help with that during the free call and explain which option may fit your goal best.'
+}
+
+function enforceReplyLanguage({ text, customerLanguage, latestUserText = '' }) {
+  const targetLanguage = normalizeLanguageName(customerLanguage)
+
+  if (!targetLanguage) return text
+
+  const detectedReplyLanguage = detectLatestMessageLanguage(text)
+
+  if (!detectedReplyLanguage || detectedReplyLanguage === targetLanguage) return text
+
+  return getOutOfFlowAnswer(latestUserText, customerLanguage) ||
+    getContextualOutOfFlowFallbackAnswer(customerLanguage)
+}
+
+function buildPendingStateOutOfFlowReply(answer, customerLanguage) {
+  const askState = bookingCopy(customerLanguage, 'askState')
+  const cleanedAnswer = stripStateQuestionFromGeneratedAnswer(answer)
+
+  return cleanedAnswer ? `${cleanedAnswer}\n\n${askState}` : askState
+}
+
+function validateControlledModelAnswer(
+  answer,
+  {
+    fallbackAnswer,
+    customerLanguage,
+    messages = [],
+    booking = {},
+    callType = 'controlled_model_answer',
+    modelIntent = {},
+    ragMatchCount = 0,
+    durationMs = 0,
+  } = {},
+) {
+  const strippedAnswer =
+    booking?.pendingField === 'state'
+      ? stripStateQuestionFromGeneratedAnswer(answer)
+      : stripBookingPromptFromGeneratedAnswer(answer)
+  const text = strippedAnswer.trim()
+  const safeFallback = fallbackAnswer || getContextualOutOfFlowFallbackAnswer(customerLanguage)
+  const reason = getControlledModelAnswerBlockReason(text, {
+    messages,
+    booking,
+  })
+
+  if (!text || reason) {
+    if (reason) {
+      logModelUsage({
+        callType,
+        ...modelIntent,
+        pendingField: booking?.pendingField,
+        ragMatchCount,
+        guardrailBlocked: true,
+        guardrailReason: reason,
+        fallbackUsed: true,
+        durationMs,
+      })
+    }
+
+    return {
+      text: safeFallback,
+      blocked: Boolean(reason),
+      fallbackUsed: true,
+    }
+  }
+
+  return {
+    text,
+    blocked: false,
+    fallbackUsed: false,
+  }
+}
+
+function getControlledModelAnswerBlockReason(text, { messages = [], booking = {} } = {}) {
+  const normalized = normalizeSearchText(text)
+
+  if (!normalized) {
+    return 'empty_answer'
+  }
+
+  if (hasUnconfirmedBookingLanguage(text)) {
+    return 'unconfirmed_booking_claim'
+  }
+
+  if (hasCustomerAvailabilityQuestion(text) && booking) {
+    return 'invented_or_requested_availability'
+  }
+
+  if (text.split(/\n+/).some((line) => isBookingPromptLine(line) || isStateQuestionLine(line))) {
+    return 'model_asked_booking_step'
+  }
+
+  if (hasForbiddenControlledModelClaim(normalized)) {
+    return 'forbidden_claim'
+  }
+
+  if (hasUnsupportedLocationClaim(text, messages, booking)) {
+    return 'unsupported_location_claim'
+  }
+
+  return ''
+}
+
+function hasForbiddenControlledModelClaim(normalized) {
+  return [
+    /\b(refund|replacement|credit|compensation)\b[\s\S]{0,60}\b(approved|confirmed|guaranteed|will receive|we will send|we can issue)\b/,
+    /\b(garantizado|garantizada|garantizamos|garantia)\b[\s\S]{0,80}\b(resultado|bajar|perder|adelgazar|seguro)\b/,
+    /\b(guarantee|guaranteed|will lose|safe for everyone|no side effects|works for everyone)\b/,
+    /\b(send|provide|share|give)\b[\s\S]{0,50}\b(full address|shipping address|home address|direccion completa|direcci[oó]n completa)\b/,
+    /\b(start|stop|change)\b[\s\S]{0,40}\b(medication|medicine|dose|dosage|medicamento|dosis)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function hasUnsupportedLocationClaim(text, messages = [], booking = {}) {
+  const normalized = normalizeSearchText(text)
+  const knownState = booking?.details?.state || extractRespondBookingDetails(messages).state
+
+  if (/\b(previously mentioned|you mentioned earlier|as you said|as you shared)\b[\s\S]{0,80}\b(state|city|location|michigan|delaware)\b/.test(normalized)) {
+    return true
+  }
+
+  if (!knownState && /\b(your state|your city|your location)\b[\s\S]{0,80}\b(michigan|delaware|california|texas|florida|new york)\b/.test(normalized)) {
+    return true
+  }
+
+  return false
+}
+
+function stripStateQuestionFromGeneratedAnswer(answer) {
+  return String(answer || '')
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line && !isStateQuestionLine(line))
+    .join('\n\n')
+    .trim()
+}
+
+function stripBookingPromptFromGeneratedAnswer(answer) {
+  return String(answer || '')
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line && !isBookingPromptLine(line))
+    .join('\n\n')
+    .trim()
+}
+
+function isBookingPromptLine(line) {
+  if (isGeneratedSlotReofferLine(line)) return true
+  if (isGeneratedBookingPromptLine(line)) return true
+
+  const normalized = normalizeSearchText(line)
+
+  if (
+    [
+      /\b(lunes|martes|miercoles|jueves|viernes|sabado|domingo|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b[\s\S]{0,100}\b(am|pm|a m|p m|hora de california|hora de florida|hora del este)\b/,
+      /\b(segunda|terca|quarta|quinta|sexta|sabado|domingo|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b[\s\S]{0,100}\b(am|pm|a m|p m|horario da california|horario da florida|horario do leste)\b/,
+      /\b(confirmo esa cita|confirmar esa cita|disponible para ti|tenemos disponible|cita para ti)\b/,
+    ].some((pattern) => pattern.test(normalized))
+  ) {
+    return true
+  }
+
+  return [
+    /\b(friday|monday|tuesday|wednesday|thursday|saturday|sunday|jul|july|jan|feb|mar|apr|may|jun|aug|sep|oct|nov|dec)\b[\s\S]{0,80}\b(am|pm|a m|p m|florida time|eastern time)\b/,
+    /\b(does that work|still work|work for you|reserve that spot|book this call|available time|available slot|discovery call on)\b/,
+    /\b(to move forward|to continue|to proceed|to book|book the appointment|appointment details|please send|please share|may i please have|may i have|can i have)\b[\s\S]{0,120}\b(phone|phone number|number|full name|name)\b/,
+    /\b(te funciona|reservar ese espacio|agendar esta llamada|horario disponible|llamada gratuita)\b/,
+    /\b(para avanzar|para continuar|para proceder|para agendar|agendar la cita|detalles de tu cita|enviame|envia|comparte|me puedes enviar|puedes enviarme)\b[\s\S]{0,120}\b(telefono|numero|nombre completo|nombre)\b/,
+    /\b(funciona para voce|funciona para voc[eê]|reservar esse horario|horario disponivel|chamada gratuita)\b/,
+    /\b(para avancar|para continuar|para prosseguir|para agendar|detalhes do seu agendamento|me envie|compartilhe|pode me enviar)\b[\s\S]{0,120}\b(telefone|numero|nome completo|nome)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isStateQuestionLine(line) {
+  const normalized = normalizeSearchText(line)
+
+  return /\b(state|estado|estado|where do you live|which state|que estado|qual estado|shipping availability|ship to your state|envios|entregas)\b/.test(
+    normalized,
+  )
+}
+
+
+function formatNumberedSlots(options = [], state = '', language = '') {
+  return options
+    .map((option, index) => {
+      const specialistName = option.sellerName ? `Specialist ${option.sellerName} - ` : ''
+      const slot = formatWhatsAppBold(formatCustomerStateSlot(
+        option.startTime,
+        state,
+        option.timezone,
+        language,
+      ))
+
+      return `${index + 1}. ${specialistName}${slot}`
+    })
+    .join('\n')
+}
+
+function formatWhatsAppBold(value = '') {
+  const text = String(value || '').trim()
+
+  return text && !/^\*[^*]+\*$/.test(text) ? `*${text}*` : text
+}
+
+function pickRespondAvailabilityOption(content, options = [], state = '') {
+  const normalized = normalizeSearchText(content)
+  const selectedId =
+    normalized.match(/^(?:option|number|slot|opcion|opción|numero|número|la|el)?\s*(\d{1,2})$/)?.[1] ||
+    normalized.match(/\b(?:option|number|slot|opcion|opción|numero|número|la|el)\s+(\d{1,2})\b/)?.[1]
+
+  return options.find((option) => option.id === selectedId) ||
+    pickRespondAvailabilityOptionByTime(content, options, state) ||
+    null
+}
+
+function pickRespondAvailabilityOptionByTime(content, options = [], state = '') {
+  if (!options.length) {
+    return null
+  }
+
+  const requestedTime = extractRequestedSlotTime(content)
+
+  if (!requestedTime) {
+    return null
+  }
+
+  const requestedDate = extractRequestedSlotDate(content)
+  const requestedWeekday = extractRequestedSlotWeekday(content)
+  const candidateOptions = options.filter((option) => {
+    const optionTime = getOptionCustomerTime(option, state)
+
+    if (!optionTime || optionTime.hour !== requestedTime.hour) {
+      return false
+    }
+
+    if (requestedTime.minute != null && optionTime.minute !== requestedTime.minute) {
+      return false
+    }
+
+    if (requestedDate && requestedDate !== getOptionCustomerDateKey(option, state)) {
+      return false
+    }
+
+    if (requestedWeekday && requestedWeekday !== getOptionCustomerWeekdayKey(option, state)) {
+      return false
+    }
+
+    return true
+  })
+
+  return candidateOptions.length === 1 ? candidateOptions[0] : null
+}
+
+function extractRequestedSlotTime(content) {
+  const match = String(content || '').match(/\b(1[0-2]|0?[1-9])(?:[:.](\d{2}))?\s*(am|pm)\b/i)
+
+  if (!match) {
+    return null
+  }
+
+  let hour = Number(match[1])
+  const minute = match[2] == null ? null : Number(match[2])
+  const period = match[3].toLowerCase()
+
+  if (period === 'pm' && hour < 12) {
+    hour += 12
+  }
+
+  if (period === 'am' && hour === 12) {
+    hour = 0
+  }
+
+  return { hour, minute }
+}
+
+function extractRequestedSlotDate(content) {
+  const monthDayMatch = String(content || '').match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i,
+  )
+
+  return monthDayMatch
+    ? `${monthDayMatch[1].slice(0, 3).toLowerCase()} ${Number(monthDayMatch[2])}`
+    : ''
+}
+
+function extractRequestedSlotWeekday(content) {
+  const match = String(content || '').match(
+    /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|mi[eÃ©]rcoles|jueves|viernes|sabado|s[aÃ¡]bado)\b/i,
+  )
+
+  return match ? normalizeSearchText(match[1]) : ''
+}
+
+function getOptionCustomerTime(option, state = '') {
+  const timeText = formatCustomerStateTime(option.startTime, state, option.timezone)
+  const match = timeText.match(/\b(1[0-2]|0?[1-9])(?:[:.](\d{2}))?\s*(am|pm)\b/i)
+
+  if (!match) {
+    return null
+  }
+
+  let hour = Number(match[1])
+  const minute = Number(match[2] || 0)
+  const period = match[3].toLowerCase()
+
+  if (period === 'pm' && hour < 12) {
+    hour += 12
+  }
+
+  if (period === 'am' && hour === 12) {
+    hour = 0
+  }
+
+  return { hour, minute }
+}
+
+function getOptionCustomerDateKey(option, state = '') {
+  const slotText = formatCustomerStateSlot(option.startTime, state, option.timezone)
+  const match = slotText.match(
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})\b/i,
+  )
+
+  return match ? `${match[1].slice(0, 3).toLowerCase()} ${Number(match[2])}` : ''
+}
+
+function getRejectedAvailabilityDateKey(content, booking = {}, details = {}) {
+  if (!isNegativeAvailabilityReply(content) && !isNegatedAvailabilityPreference(content)) {
+    return ''
+  }
+
+  const explicitDate = extractRequestedSlotDate(content) || extractMonthDayDateKey(content)
+
+  if (explicitDate) return explicitDate
+
+  const rejectedRelativeOrWeekday = rejectsOfferedCalendarDate(content)
+  const activeOption = booking.offeredOption || booking.options?.[0]
+
+  // A negated relative day (for example, "mañana no puedo") rejects the
+  // entire offered calendar date, rather than only the offered time.
+  return rejectedRelativeOrWeekday && activeOption
+    ? getOptionCustomerDateKey(activeOption, details.state || booking.details?.state)
+    : ''
+}
+
+function extractMonthDayDateKey(content) {
+  const match = String(content || '').match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i,
+  )
+
+  return match ? `${match[1].slice(0, 3).toLowerCase()} ${Number(match[2])}` : ''
+}
+
+function getOptionCustomerWeekdayKey(option, state = '') {
+  return normalizeSearchText(formatCustomerStateSlot(option.startTime, state, option.timezone).split(',')[0])
+}
+
+function isActiveBookingContinuation(booking, latestUserText) {
+  if (booking.pendingField) {
+    return true
+  }
+
+  if (booking.options?.length > 0 || booking.offeredOption) {
+    return (
+      pickRespondAvailabilityOption(latestUserText, booking.options, booking.details?.state) ||
+      isAffirmative(latestUserText) ||
+      isNegativeReply(latestUserText) ||
+      extractPreferredTimeText(latestUserText) ||
+      isBookingRequest(latestUserText)
+    )
+  }
+
+  return isBookingRequest(latestUserText)
+}
+
+function isGreetingOnly(content) {
+  const normalized = normalizeSearchText(content)
+
+  return /^(hi|hello|hey|hola|buenas|buenos dias|buenas tardes|buenas noches|ola|oi)$/.test(normalized)
+}
+
+function acknowledgeGreeting(language) {
+  const langNorm = normalizeLanguageName(language)
+
+  if (langNorm === 'Latin American Spanish') {
+    return 'Hola, con gusto. ✨'
+  }
+
+  if (langNorm === 'Portuguese') {
+    return 'Olá, com prazer. ✨'
+  }
+
+  return 'Hello, happy to help. ✨'
+}
+
+function isAffirmative(content) {
+  const normalized = normalizeSearchText(content)
+
+  if (/[?]/.test(String(content || '')) || /\b(when|what time|which|cuando|que hora)\b/.test(normalized)) {
+    return false
+  }
+
+  return (
+    isExactCasualAffirmative(content) ||
+    /\b(yes|yeah|yep|ok|okay|sure|works|perfect|perfecto|perfecta|perfeito|perfeita|confirm|book it|si|claro|dale|esta bien|correcto|confirmo|agendalo|reserva)\b/i.test(
+      normalized,
+    )
+  )
+}
+
+function isSlotAffirmation(content, latestSignals = {}) {
+  if (!isAffirmative(content)) {
+    return false
+  }
+
+  if (isStateConfirmationReply(content, latestSignals)) {
+    return false
+  }
+
+  return true
+}
+
+function isInferredStateAffirmation(content) {
+  const normalized = normalizeSearchText(content)
+
+  return isAffirmative(content) || /\b(that city|same city|there|ahi|alli|esa ciudad|essa cidade|cidade)\b/.test(normalized)
+}
+
+function isStateConfirmationReply(content, latestSignals = {}) {
+  const normalized = normalizeSearchText(content)
+
+  if (latestSignals.state) {
+    return true
+  }
+
+  return /\b(my|home|shipping|delivery|domicilio|casa|envio|envios|entrega|estado|state)\b/.test(normalized)
+}
+
+function isSlotRejection(content) {
+  const normalized = normalizeSearchText(content)
+
+  return (
+    isNegativeAvailabilityReply(content) ||
+    isTooEarlyAvailabilityReply(content) ||
+    /\b(no|nope|nah|not|doesn t work|doesnt work|otro|otra|different|later|mas tarde)\b/i.test(
+      normalized,
+    ) || isNegative(content)
+  )
+}
+
+function isNegative(content) {
+  return /\b(no|not|doesn'?t work|otro|otra|different|later|mas tarde|m[aá]s tarde)\b/i.test(content)
+}
+
+function isNegativeReply(content) {
+  const normalized = normalizeSearchText(content)
+
+  if (isOutOfFlowInfoQuestion(content)) {
+    return false
+  }
+
+  if (
+    isNegativeAvailabilityReply(content) ||
+    isTooEarlyAvailabilityReply(content) ||
+    isNegatedAvailabilityPreference(content)
+  ) {
+    return true
+  }
+
+  if (extractAvailabilityPreference(content).hasPreference) {
+    return false
+  }
+
+  return (
+    /\b(no|nope|nah|not|doesn t work|doesnt work|otro|otra|different|later|mas tarde)\b/i.test(
+      normalized,
+    ) || isNegative(content)
+  )
+}
+
+function isNegativeAvailabilityReply(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(can t|cannot|cant|can not|won t|wont|unable|unavailable|not available|will not be available|doesn t work|doesnt work|does not work|not that)\b/,
+    /\b(no puedo|no podre|no podria|no me funciona|no estoy disponible|no estare disponible|no voy a estar disponible|no puedo hacerlo|no me sirve)\b/,
+    /\b(nao posso|nao consigo|nao estou disponivel|nao estarei disponivel|nao vou estar disponivel|nao funciona)\b/,
+    /\b(this week|current week|rest of the week|remainder of the week)\b[\s\S]{0,50}\b(no|not|unavailable|can t|cannot|won t|wont)\b/,
+    /\b(esta semana|semana actual|resto de la semana|lo que queda de la semana)\b[\s\S]{0,50}\b(no|tampoco|imposible)\b/,
+    /\b(esta semana|semana atual|resto da semana|restante da semana)\b[\s\S]{0,50}\b(nao|impossivel)\b/,
+    /\b(today)\b[\s\S]{0,40}\b(work|working|at work)\b|\b(work|working|at work)\b[\s\S]{0,40}\b(today)\b/,
+    /\b(hoy)\b[\s\S]{0,40}\b(trabajo|trabajando|en el trabajo)\b|\b(trabajo|trabajando|en el trabajo)\b[\s\S]{0,40}\b(hoy)\b/,
+    /\b(hoje)\b[\s\S]{0,40}\b(trabalho|trabalhando|no trabalho)\b|\b(trabalho|trabalhando|no trabalho)\b[\s\S]{0,40}\b(hoje)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function getGeneralProductOverviewAnswer(customerLanguage) {
+  const language = normalizeLanguageName(customerLanguage)
+
+  if (language === 'Latin American Spanish') {
+    return 'Ofrecemos opciones personalizadas de Semaglutide y Tirzepatide para apoyar la pérdida de peso, siempre sujetas a la evaluación del proveedor. Tenemos un plan de alrededor de $589. Durante la llamada gratuita de evaluación, nuestro especialista te explicará en detalle las demás opciones y precios según tus necesidades, responderá tus preguntas y te ayudará a encontrar el plan que mejor se adapte a ti.'
+  }
+
+  if (language === 'Portuguese') {
+    return 'Oferecemos opções personalizadas de Semaglutide e Tirzepatide para apoiar a perda de peso, sempre sujeitas à avaliação do provedor. Temos um plano na faixa de $589. Durante a chamada gratuita de avaliação, nosso especialista explicará em detalhes as outras opções e preços de acordo com suas necessidades, responderá às suas perguntas e ajudará você a encontrar o plano mais adequado.'
+  }
+
+  return 'We offer personalized Semaglutide and Tirzepatide options to support weight loss, subject to provider evaluation. We have a plan in the $589 range. During the free evaluation call, our specialist will explain the other options and prices in more detail based on your needs, answer your questions, and help identify the plan that best fits you.'
+}
+
+function isTooEarlyAvailabilityReply(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(too early|very early|so early|that is early|too soon in the morning|early morning)\b/,
+    /\b(muy temprano|demasiado temprano|muy pronto|demasiado pronto|tan temprano|es temprano)\b/,
+    /\b(muito cedo|cedo demais)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isOutOfFlowInfoQuestion(content) {
+  const normalized = normalizeSearchText(content)
+
+  if (!normalized) {
+    return false
+  }
+
+  if (
+    isTreatmentAcquisitionQuestion(content) ||
+    isClientTreatmentPrivacyQuestion(normalized) ||
+    isMedicalHistoryOrSafetyQuestion(normalized) ||
+    isProductOrMedicationQuestion(normalized) ||
+    isPopularityOrBestSellerQuestion(normalized) ||
+    isInjectionEffectTimingQuestion(normalized) ||
+    isInjectionFrequencyQuestion(normalized)
+  ) {
+    return true
+  }
+
+  if (hasPriceOrPaymentQuestion(normalized) || isGeneralQuestionDetour(normalized)) {
+    return true
+  }
+
+  return [
+    /\b(what|whats|what is|tell me|explain|learn more|more about|about your|about the|how long|how soon|how fast|how does|how do|how it works|what happens|what includes|included|difference|safe|side effect|side effects|price|cost|payment|company|clinic|program|treatment|medication|medicine|injection|semaglutide|tirzepatide|zepbound|glp 1|supplement|nutrition|peptide|doctor|doctors|provider|providers|fda|approved|review|reviews|location|located|address|where are you|dayanara|celebrity|public figure|client treatment|patient treatment)\b/.test(normalized),
+    /\b(que es|de que|explica|explicame|quiero saber|mas informacion|mas sobre|como funciona|que incluye|incluye|diferencia|seguro|efectos secundarios|precio|cuanto|costo|pago|compania|clinica|programa|tratamiento|medicamento|inyeccion|suplemento|nutricion|peptido|doctor|doctores|medico|medicos|proveedor|proveedores|fda|aprobado|resena|resenas|ubicad|ubicacion|ubicaci[oó]n|direccion|direcci[oó]n|donde estan|dayanara|celebridad|figura publica|tratamiento de cliente|tratamiento de paciente)\b/.test(normalized),
+    /\b(o que e|explique|quero saber|mais informacao|mais sobre|como funciona|o que inclui|inclui|diferenca|seguro|efeitos colaterais|preco|quanto custa|custo|pagamento|empresa|clinica|programa|tratamento|medicamento|injecao|suplemento|nutricao|peptideo|doutor|doutores|medico|medicos|provedor|provedores|fda|aprovado|avaliacao|avaliacoes|localiza|endereco|endere[cç]o|onde fica|dayanara|celebridade|figura publica|tratamento de cliente|tratamento de paciente)\b/.test(normalized),
+  ].some(Boolean)
+}
+
+function hasPriceOrPaymentQuestion(normalizedText) {
+  return /\b(prices?|costs?|pricing|payment|payments|installments?|financing|precio|precios|cuanto|cuantos|cuesta|cuestan|costo|costos|pago|pagos|cuota|cuotas|financiamiento|preco|precos|quanto custa|custam|custo|custos|pagamento|pagamentos|parcela|parcelas|financiamento)\b/.test(
+    normalizedText,
+  )
+}
+
+function isGeneralQuestionDetour(normalizedText) {
+  const startsLikeQuestion =
+    /^(what|why|how|when|where|who|which|can|could|would|do|does|is|are|tell me|explain|que|cual|cuales|como|cuando|donde|por que|puedes|podrias|quisiera|o que|qual|quais|quando|onde|pode|poderia|gostaria)\b/.test(
+      normalizedText,
+    )
+  const hasQuestionTopic =
+    /\b(treatment|program|medicine|medication|injection|price|cost|payment|doctor|provider|clinic|company|appointment|call|consulta|tratamiento|programa|medicamento|inyeccion|precio|costo|pago|doctor|medico|clinica|cita|llamada|tratamento|injecao|preco|pagamento|doutor|chamada)\b/.test(
+      normalizedText,
+    )
+
+  return startsLikeQuestion && hasQuestionTopic
+}
+
+function isContextualOutOfFlowFollowUp(content, messages = []) {
+  const normalized = normalizeSearchText(content)
+
+  if (!normalized) {
+    return false
+  }
+
+  const asksAboutPriorContext = [
+    /\b(that|it|this|regarding that|about that|with that|for that)\b/,
+    /\b(eso|esto|aquello|sobre eso|con eso|respecto a eso|referente a eso)\b/,
+    /\b(isso|isto|sobre isso|com isso|referente a isso)\b/,
+  ].some((pattern) => pattern.test(normalized))
+  const asksForHelpOrExplanation = [
+    /\b(would|will|can|could|does|do|is)\b[\s\S]{0,50}\b(specialist|expert|they|you|call)\b[\s\S]{0,80}\b(help|explain|guide|answer|cover|recommend)\b/,
+    /\b(specialist|expert|they|you|call)\b[\s\S]{0,80}\b(help|explain|guide|answer|cover|recommend)\b/,
+    /\b(especialista|ustedes|llamada|cita)\b[\s\S]{0,80}\b(ayuda|ayudar|explica|explicar|orienta|orientar|responde|recomienda)\b/,
+    /\b(especialista|voces|voc[eê]s|chamada|consulta)\b[\s\S]{0,80}\b(ajuda|ajudar|explica|explicar|orienta|orientar|responde|recomenda)\b/,
+  ].some((pattern) => pattern.test(normalized))
+  const priorUserQuestion = [...messages]
+    .reverse()
+    .slice(1)
+    .find((item) => item.role === 'user' && isPriorOutOfFlowTopic(item.content || ''))
+
+  return asksAboutPriorContext && asksForHelpOrExplanation && Boolean(priorUserQuestion)
+}
+
+function shouldAnswerBeforeReturningToBooking(content, messages = [], modelIntent = null) {
+  // Deterministic question detection wins over a model-supplied booking-field
+  // classification. This prevents messages such as "direccion, precio y seguro?"
+  // from being discarded while the state question is pending.
+  const hasCustomerQuestion =
+    isOutOfFlowInfoQuestion(content) ||
+    isContextualOutOfFlowFollowUp(content, messages)
+
+  if (hasCustomerQuestion) return true
+
+  if (modelIntent?.answered_booking_field && modelIntent.answered_booking_field !== 'none') return false
+
+  return (
+    Boolean(modelIntent?.should_answer_question) ||
+    hasCustomerQuestion
+  )
+}
+
+function isPriorOutOfFlowTopic(content) {
+  const normalized = normalizeSearchText(content)
+
+  return (
+    isOutOfFlowInfoQuestion(content) ||
+    /\b(best seller|bestseller|best-selling|most popular|popular|top seller|clients|client|customers|customer|result|results)\b/.test(
+      normalized,
+    ) ||
+    /\b(mas vendido|m[aá]s vendido|mas popular|m[aá]s popular|clientes|cliente|resultados|resultado)\b/.test(
+      normalized,
+    ) ||
+    /\b(mais vendido|mais popular|clientes|cliente|resultados|resultado)\b/.test(normalized)
+  )
+}
+
+function isConversationDeferralReply(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(no thank you|no thanks|thanks but no|talk to you later|talk later|another time|some other time|not now|later maybe|i ll contact|i will contact)\b/,
+    /\b(no gracias|hablamos luego|te contacto luego|otro dia|otra ocasion|en otro momento|ahora no|luego veo|despues veo)\b/,
+    /\b(voy a (?:ver|revisar|checar)|reviso|checo)\b[\s\S]{0,80}\b(te aviso|te digo|les aviso|les digo)\b/,
+    /\b(nao obrigada|nao obrigado|falo depois|volto a contactar|volto a contatar|outro dia|outra hora|outro momento|agora nao)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isSundayAvailabilityPreference(value = '') {
+  return /\b(sunday|domingo)\b/.test(normalizeSearchText(value))
+}
+
+function replaceSundayWithSaturday(value = '') {
+  return String(value || 'saturday')
+    .replace(/\bsunday\b/gi, 'saturday')
+    .replace(/\bdomingo\b/gi, 'sabado')
+}
+
+function getPositiveAvailabilityPreferenceText(content) {
+  const text = String(content || '').trim()
+
+  if (!text) {
+    return ''
+  }
+
+  const positiveMatch = text.match(
+    /\b(?:just|only|except|but|solo|solamente|excepto|pero|s[oó]|apenas|mas)\b\s+(.+)$/i,
+  )
+
+  if (positiveMatch) {
+    return positiveMatch[1].trim()
+  }
+
+  const positiveNeedMatch = text.match(
+    /\b(?:i\s+need|need|i\s+can\s+do|can\s+do|i\s+am\s+available|i'm\s+available|available\s+for|works\s+for\s+me|me\s+funciona|necesito|puedo|estoy\s+disponible|preciso|posso|estou\s+disponivel)\b\s+(.+)$/i,
+  )
+
+  if (positiveNeedMatch && hasAvailabilityDateOrTimeSignal(positiveNeedMatch[1])) {
+    return positiveNeedMatch[1].trim()
+  }
+
+  const availabilityAfterNegativeMatch = text.match(
+    /\b(?:no|nope|nah|not that|that doesn't work|that does not work|no puedo|no me funciona|nao funciona|nao posso)\b[\s,.;:-]*(?:i'?m\s+)?(?:only\s+)?(?:available|free|disponible|puedo|posso)?\s*(.+)$/i,
+  )
+
+  if (
+    availabilityAfterNegativeMatch &&
+    hasAvailabilityDateOrTimeSignal(availabilityAfterNegativeMatch[1])
+  ) {
+    return availabilityAfterNegativeMatch[1].trim()
+  }
+
+  const normalized = normalizeSearchText(text)
+
+  if (
+    /\b(afternoon|tarde)\b[\s\S]{0,40}\b(good|works|is good|works for me|fine|ok|okay|me funciona|esta bien)\b/.test(
+      normalized,
+    ) ||
+    /\b(can t|cannot|cant|can not|not available|doesn t work|doesnt work)\b[\s\S]{0,40}\b(morning)\b/.test(
+      normalized,
+    ) ||
+    /\b(no puedo|no me funciona|no estoy disponible)\b[\s\S]{0,40}\b(manana|maÃ±ana)\b/.test(
+      normalized,
+    )
+  ) {
+    return 'afternoon'
+  }
+
+  if (
+    /\b(evening|night|noche|noite)\b[\s\S]{0,40}\b(good|works|is good|works for me|fine|ok|okay|me funciona|esta bien)\b/.test(
+      normalized,
+    )
+  ) {
+    return 'evening'
+  }
+
+  return isNegatedAvailabilityPreference(text) ? '' : text
+}
+
+function hasAvailabilityDateOrTimeSignal(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(january|jan|enero|janeiro|february|feb|febrero|fevereiro|march|mar|marzo|marco|april|apr|abril|may|mayo|maio|june|jun|junio|junho|july|jul|julio|julho|august|aug|agosto|september|sep|sept|septiembre|setembro|october|oct|octubre|outubro|november|nov|noviembre|novembro|december|dec|diciembre|dezembro)\b/,
+    /\b(next week|following week|proxima semana|semana que viene|semana siguiente|semana seguinte)\b/,
+    /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|morning|afternoon|evening|am|pm)\b/,
+    /\b(hoy|manana|lunes|martes|miercoles|jueves|viernes|sabado|domingo|tarde|noche)\b/,
+    /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|tarde|noite)\b/,
+    /\b\d{1,2}(?::\d{2})?\s*(am|pm)?\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isNegatedAvailabilityPreference(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(can t|cannot|cant|can not|won t|wont|unable|not available|doesn t work|doesnt work)\b[\s\S]{0,40}\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|morning|afternoon|evening|\d{1,2}(?::\d{2})?)\b/,
+    /\b(no puedo|no podre|no podria|no me funciona|no estoy disponible)\b[\s\S]{0,40}\b(hoy|manana|dia siguiente|lunes|martes|miercoles|jueves|viernes|sabado|domingo|tarde|noche|\d{1,2}(?::\d{2})?)\b/,
+    /\b(nao posso|nao consigo|nao estou disponivel|nao funciona)\b[\s\S]{0,40}\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|tarde|noite|\d{1,2}(?::\d{2})?)\b/,
+    /\b(can t|cannot|cant|can not|won t|wont|not available|unavailable|will not be available)\b[\s\S]{0,60}\b(this week|current week|rest of the week|remainder of the week)\b/,
+    /\b(no puedo|no podre|no podria|no estoy disponible|no estare disponible|no voy a estar disponible)\b[\s\S]{0,60}\b(esta semana|semana actual|resto de la semana|lo que queda de la semana)\b/,
+    /\b(nao posso|nao consigo|nao estou disponivel|nao estarei disponivel|nao vou estar disponivel)\b[\s\S]{0,60}\b(esta semana|semana atual|resto da semana|restante da semana)\b/,
+    /\b(this week|current week|rest of the week|remainder of the week)\b[\s\S]{0,60}\b(no|not|unavailable|can t|cannot|won t|wont)\b/,
+    /\b(esta semana|semana actual|resto de la semana|lo que queda de la semana)\b[\s\S]{0,60}\b(no|tampoco|imposible)\b/,
+    /\b(esta semana|semana atual|resto da semana|restante da semana)\b[\s\S]{0,60}\b(nao|impossivel)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function extractAvailabilityPreference(content) {
+  const preferenceText = getPositiveAvailabilityPreferenceText(content)
+  const normalized = normalizeSearchText(preferenceText)
+  const combinedTomorrowPart = getCombinedTomorrowDayPartPreference(normalized)
+
+  if (combinedTomorrowPart) {
+    return combinedTomorrowPart
+  }
+
+  if (!normalized) {
+    return { hasPreference: false }
+  }
+
+  const requestedMonthDay = extractAvailabilityMonthDay(preferenceText)
+  const requestedMonth = extractAvailabilityMonth(preferenceText)
+  const positiveDayPart = extractPositiveDayPartConstraint(content)
+
+  if (requestedMonthDay) {
+    return {
+      hasPreference: true,
+      ...(positiveDayPart || { dayPart: '' }),
+      preferredTime: `${requestedMonthDay.name} ${requestedMonthDay.day}${positiveDayPart?.preferredTime ? ` ${positiveDayPart.preferredTime}` : ''}`,
+      direction: 'date',
+    }
+  }
+
+  if (requestedMonth) {
+    return {
+      hasPreference: true,
+      ...(positiveDayPart || { dayPart: '' }),
+      preferredTime: `${requestedMonth.name}${positiveDayPart?.preferredTime ? ` ${positiveDayPart.preferredTime}` : ''}`,
+      direction: 'month',
+    }
+  }
+
+  if (positiveDayPart) {
+    return { hasPreference: true, ...positiveDayPart }
+  }
+
+  if (/\b(next week|following week|proxima semana|semana que viene|semana siguiente|semana seguinte)\b/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'next week',
+      dayPart: '',
+      direction: 'next_week',
+    }
+  }
+
+  const afterTime = parseAfterTimePreference(preferenceText)
+
+  if (afterTime) {
+    return {
+      hasPreference: true,
+      preferredTime: `after ${formatPreferenceClock(afterTime.hour, afterTime.minute)}`,
+      earliestHour: afterTime.hour,
+      earliestMinuteOfDay: afterTime.minutesOfDay,
+      dayPart: afterTime.hour >= 12 ? 'afternoon' : 'morning',
+      direction: 'after',
+    }
+  }
+
+  const exactClockMatch = String(preferenceText || '').match(
+    /\b(1[0-2]|0?[1-9])(?:[:.](\d{2}))?\s*(am|pm)\b|\b(?:at|a las|las)\s+(1[0-2]|0?[1-9])(?:[:.](\d{2}))?\s*(am|pm)?\b/i,
+  )
+
+  if (exactClockMatch) {
+    const hour = normalizeAvailabilityHour(
+      Number(exactClockMatch[1] || exactClockMatch[4]),
+      exactClockMatch[3] || exactClockMatch[6] || '',
+    )
+    return {
+      hasPreference: true,
+      preferredTime: extractPreferredTimeText(content) || exactClockMatch[0].trim(),
+      earliestHour: hour,
+      dayPart: hour >= 12 ? 'afternoon' : 'morning',
+      direction: 'exact',
+      allowBeforeDefaultStart: hour < 9,
+    }
+  }
+
+  if (isEarlierSchedulingPreference(preferenceText)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'morning',
+      direction: 'earlier',
+      allowBeforeDefaultStart: true,
+    }
+  }
+
+  if (/\b(day after tomorrow|pasado manana|pasado manaña|depois de amanha)\b/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'day after tomorrow',
+      dayPart: '',
+    }
+  }
+
+  if (/\b(tomorrow|next day|the next day|next available day|manana|manaña|dia siguiente|proximo dia|amanha)\b/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'tomorrow',
+      dayPart: '',
+    }
+  }
+
+  if (/\b(later|later today|later on today|mas tarde|mas tarde hoy|mas tarde hoje)\b/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'afternoon',
+      earliestHour: 12,
+      dayPart: 'afternoon',
+    }
+  }
+
+  if (/^(afternoon|tarde)$/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'afternoon',
+      earliestHour: 12,
+      dayPart: 'afternoon',
+    }
+  }
+
+  if (/^(morning|manana|manha)$/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'morning',
+      earliestHour: 9,
+      latestHour: 12,
+      dayPart: 'morning',
+    }
+  }
+
+  if (/^(evening|night|noche|noite)$/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'evening',
+      earliestHour: 17,
+      dayPart: 'evening',
+    }
+  }
+
+  if (
+    /\b(afternoon only|only afternoon|in the afternoon|not morning|no morning|later because i work|later because of work)\b/.test(
+      normalized,
+    ) ||
+    /\b(solo en la tarde|por la tarde|en la tarde|no en la manana|no en la mañana|mas tarde porque trabajo|más tarde porque trabajo|tarde porque trabajo)\b/.test(
+      normalized,
+    )
+  ) {
+    return {
+      hasPreference: true,
+      preferredTime: 'afternoon',
+      earliestHour: 12,
+      dayPart: 'afternoon',
+    }
+  }
+
+  if (/\b(evening only|in the evening|evening|noche|en la noche|por la noche)\b/.test(normalized)) {
+    return {
+      hasPreference: true,
+      preferredTime: 'evening',
+      earliestHour: 17,
+      dayPart: 'evening',
+    }
+  }
+
+  return { hasPreference: false }
+}
+
+function resolveRespondPreferredTime({ existingDetails = {}, latestSignals = {}, latestUserText = '' } = {}) {
+  const explicitPreferredTime = latestSignals.preferredTime || ''
+  const existingPreferredTime = existingDetails?.preferredTime || ''
+  const latestAvailabilityPreference = extractAvailabilityPreference(latestUserText)
+
+  if (!explicitPreferredTime && isUnavailableTodayReply(latestUserText)) {
+    return 'tomorrow'
+  }
+
+  if (!explicitPreferredTime && !latestAvailabilityPreference.hasPreference) {
+    return existingPreferredTime
+  }
+
+  const datePart =
+    extractPreferredDatePhrase(explicitPreferredTime) ||
+    extractPreferredDatePhrase(latestUserText) ||
+    extractPreferredDatePhrase(existingPreferredTime)
+  const timePart =
+    extractPreferredClockOrDayPart(explicitPreferredTime) ||
+    extractPreferredClockOrDayPart(latestUserText)
+
+  if (datePart && timePart) {
+    return `${datePart} ${timePart}`.trim()
+  }
+
+  if (explicitPreferredTime && extractPreferredDatePhrase(explicitPreferredTime)) {
+    return explicitPreferredTime
+  }
+
+  if (explicitPreferredTime && extractPreferredClockOrDayPart(explicitPreferredTime) && datePart) {
+    return `${datePart} ${explicitPreferredTime}`.trim()
+  }
+
+  return explicitPreferredTime || existingPreferredTime
+}
+
+function applyAvailabilityConstraintFromPreferredTime(details = {}) {
+  const normalized = normalizeSearchText(details.preferredTime)
+
+  if (!normalized || Number.isInteger(details.earliestHour)) {
+    return details
+  }
+
+  if (/\b(after 5pm|5pm|5 pm|evening|noche)\b/.test(normalized)) {
+    return { ...details, earliestHour: 17, dayPart: 'evening' }
+  }
+
+  if (/\b(afternoon|tarde)\b/.test(normalized)) {
+    return { ...details, earliestHour: 12, dayPart: 'afternoon' }
+  }
+
+  if (/\b(morning|manana|manha)\b/.test(normalized)) {
+    return { ...details, earliestHour: 9, latestHour: 12, dayPart: 'morning' }
+  }
+
+  return details
+}
+
+function applyDefaultAvailabilityWindow(details = {}, preferredTime = '') {
+  return applyDefaultAvailabilityRule(details, preferredTime)
+}
+
+function getCombinedTomorrowDayPartPreference(normalized) {
+  if (!hasTomorrowSignal(normalized) || !/\b(afternoon|tarde|evening|noche|5pm|after 5|after five)\b/.test(normalized)) {
+    return null
+  }
+
+  const evening = /\b(evening|noche|5pm|after 5|after five)\b/.test(normalized)
+
+  return {
+    hasPreference: true,
+    preferredTime: evening ? 'tomorrow after 5pm' : 'tomorrow afternoon',
+    earliestHour: evening ? 17 : 12,
+    dayPart: evening ? 'evening' : 'afternoon',
+  }
+}
+
+function hasTomorrowSignal(normalized) {
+  return /\b(tomorrow|next day|the next day|next available day|manana|dia siguiente|proximo dia|amanha)\b/.test(
+    normalized,
+  )
+}
+
+function isUnavailableTodayReply(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    /\b(can t|cannot|cant|can not|not available|doesn t work|doesnt work|no)\b[\s\S]{0,40}\b(today)\b/,
+    /\b(no puedo|no podre|no podria|no me funciona|no estoy disponible|no)\b[\s\S]{0,40}\b(hoy)\b/,
+    /\b(nao posso|nao consigo|nao estou disponivel|nao funciona|nao)\b[\s\S]{0,40}\b(hoje)\b/,
+    /\b(today)\b[\s\S]{0,40}\b(work|working|at work)\b|\b(work|working|at work)\b[\s\S]{0,40}\b(today)\b/,
+    /\b(hoy)\b[\s\S]{0,40}\b(trabajo|trabajando|en el trabajo)\b|\b(trabajo|trabajando|en el trabajo)\b[\s\S]{0,40}\b(hoy)\b/,
+    /\b(hoje)\b[\s\S]{0,40}\b(trabalho|trabalhando|no trabalho)\b|\b(trabalho|trabalhando|no trabalho)\b[\s\S]{0,40}\b(hoje)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function extractPreferredDatePhrase(content) {
+  const normalized = normalizeSearchText(content)
+  const requestedMonthDay = extractAvailabilityMonthDay(content)
+
+  if (requestedMonthDay) {
+    return `${requestedMonthDay.name} ${requestedMonthDay.day}`
+  }
+  const requestedMonth = extractAvailabilityMonth(content)
+
+  if (requestedMonth) {
+    return requestedMonth.name
+  }
+
+  if (/\b(day after tomorrow|pasado manana|pasado manana|depois de amanha)\b/.test(normalized)) {
+    return 'day after tomorrow'
+  }
+
+  if (/\b(tomorrow|next day|the next day|next available day|manana|dia siguiente|proximo dia|amanha)\b/.test(normalized)) {
+    return 'tomorrow'
+  }
+
+  if (/\b(today|hoy|hoje)\b/.test(normalized)) {
+    return 'today'
+  }
+
+  const weekdayPreference = extractWeekdayPreferenceText(content)
+
+  if (weekdayPreference) {
+    return weekdayPreference
+  }
+
+  const weekday = String(content || '').match(
+    /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|mi[eé]rcoles|jueves|viernes|sabado|s[aá]bado|segunda|terca|terça|quarta|quinta|sexta)\b/i,
+  )
+
+  if (weekday) {
+    return weekday[0].trim()
+  }
+
+  const explicitDate = String(content || '').match(
+    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b/i,
+  )
+
+  return explicitDate?.[0]?.trim() || ''
+}
+
+function extractPreferredClockOrDayPart(content) {
+  const normalized = normalizeSearchText(content)
+  const clock = String(content || '').match(/\b(?:around|about|like|como|a las|las|at)?\s*(1[0-2]|0?[1-9])(?:[:.]\d{2})?\s*(am|pm)\b/i)
+
+  if (clock) {
+    return clock[0].trim()
+  }
+
+  const bareHour = String(content || '').match(/\b(?:around|about|like|como|a las|las|at)\s+(1[0-2]|0?[1-9])\b/i)
+
+  if (bareHour) {
+    const hour = Number(bareHour[1])
+    return `${hour}${hour >= 8 && hour <= 11 ? 'am' : 'pm'}`
+  }
+
+  if (/\b(after 5|after five|5pm|evening|noche|por la noche|en la noche)\b/.test(normalized)) {
+    return 'after 5pm'
+  }
+
+  if (/\b(afternoon|por la tarde|en la tarde|tarde)\b/.test(normalized)) {
+    return 'afternoon'
+  }
+
+  if (/\b(morning|manana|por la manana|en la manana)\b/.test(normalized)) {
+    return 'morning'
+  }
+
+  return ''
+}
+
+function normalizeAvailabilityHour(hour, period = '') {
+  if (!Number.isInteger(hour) || hour < 1 || hour > 12) {
+    return null
+  }
+
+  const normalizedPeriod = String(period || '').toLowerCase()
+
+  if (normalizedPeriod === 'am') {
+    return hour === 12 ? 0 : hour
+  }
+
+  if (normalizedPeriod === 'pm') {
+    return hour === 12 ? 12 : hour + 12
+  }
+
+  return hour >= 1 && hour <= 7 ? hour + 12 : hour
+}
+
+function formatPreferenceHour(hour) {
+  const normalizedHour = Number(hour)
+  const period = normalizedHour >= 12 ? 'pm' : 'am'
+  const displayHour = normalizedHour % 12 || 12
+
+  return `${displayHour}${period}`
+}
+
+function formatPreferenceClock(hour, minute = 0) {
+  const base = formatPreferenceHour(hour)
+  if (!minute) return base
+
+  return base.replace(/(am|pm)$/i, `:${String(minute).padStart(2, '0')}$1`)
+}
+
+function isBookingRequest(content) {
+  const normalized = normalizeSearchText(content)
+
+  return /\b(appointment|appointments|book|booking|schedule|scheduled|scheduling|availability|available|slot|slots|calendar|discovery call|call|meeting|today|tomorrow|cita|citas|agendar|agenda|agendame|horario|horarios|disponible|disponibilidad|consulta|llamada|reunion|marcar|marcame)\b/i.test(
+    normalized,
+  )
+}
+
+function isBookingFlowSignal(content) {
+  const normalized = normalizeSearchText(content)
+
+  return [
+    extractStateName(content),
+    extractDesiredTreatmentName(content),
+    extractPreferredTimeText(content),
+    /\b(weight loss|lose weight|losing weight|bajar de peso|perder peso|semaglutide|tirzepatide|zepbound|glp 1|injection|injections|supplements|nutrition|peptide|peptides)\b/.test(normalized),
+    /\b(today|tomorrow|morning|afternoon|evening|am|pm|july|jul|monday|tuesday|wednesday|thursday|friday|saturday|sunday|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/.test(normalized),
+  ].some(Boolean)
+}
+
+function splitCustomerName(content) {
+  const cleaned = cleanLikelyName(content)
+  if (!isLikelyCustomerName(cleaned)) {
+    return {}
+  }
+  const parts = cleaned.split(/\s+/).filter(Boolean)
+
+  return {
+    firstName: parts[0] || '',
+    lastName: parts.slice(1).join(' '),
+  }
+}
+
+function mergeNonEmptyDetails(currentDetails, nextDetails) {
+  return Object.fromEntries(
+    Object.entries({
+      ...currentDetails,
+      ...Object.fromEntries(
+        Object.entries(nextDetails || {}).filter(([, value]) => Boolean(value)),
+      ),
+    }).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function isLikelyCustomerName(content) {
+  const trimmed = String(content || '').trim()
+  const normalized = normalizeSearchText(trimmed)
+  const parts = trimmed.split(/\s+/).filter(Boolean)
+  const nonNamePhrases = [
+    /\bporque\b/,
+    /\bpor que\b/,
+    /\bbecause\b/,
+    /\btrabajo\b/,
+    /\bwork\b/,
+    /\bi work\b/,
+    /\bmy work\b/,
+    /\bno puedo\b/,
+    /\bi can t\b/,
+    /\bi cannot\b/,
+  ]
+
+  // Support accented Latin characters (Spanish, Portuguese names)
+  if (!/^[\p{L}][\p{L}' -]+$/u.test(trimmed) || parts.length < 2 || parts.length > 4) {
+    return false
+  }
+
+  if (nonNamePhrases.some((pattern) => pattern.test(normalized))) {
+    return false
+  }
+
+  if (isAffirmative(trimmed) || isNegativeReply(trimmed) || isBookingRequest(trimmed)) {
+    return false
+  }
+
+  if (isGoalOrTreatmentStatement(normalized)) {
+    return false
+  }
+
+  return !/\b(yes|yeah|yep|ok|okay|sure|works|does|good|fine|perfect|confirm|book|appointment|call|time|slot|tomorrow|today|morning|afternoon|evening|quiero|cita|si|claro|pero|solo|hablo|espanol|ingles|portuguese|portugues)\b/.test(
+    normalized,
+  )
+}
+
+function isGoalOrTreatmentStatement(normalizedContent) {
+  return /\b(i|i m|im|me|my|wanna|want|need|goal|goals|lose|losing|weight|fat|bajar|perder|peso|nutrition|nutricion|supplement|supplements|suplemento|suplementos|peptide|peptides|peptido|peptidos|injection|injections|shot|shots|semaglutide|tirzepatide|zepbound)\b/.test(
+    normalizedContent,
+  )
+}
+
+function shouldRestartRespondConversation(session) {
+  return (
+    session.messages.length === 0 ||
+    (SESSION_RESTART_WINDOW_MS > 0 &&
+      session.lastInteractionAt > 0 &&
+      Date.now() - session.lastInteractionAt >= SESSION_RESTART_WINDOW_MS)
+  )
+}
+
+async function sendInitialRespondSequence({ contactId, channelId, customerLanguage }) {
+  const greeting = getInitialGreeting(customerLanguage)
+  const stateQuestion = getInitialStateQuestion(customerLanguage)
+
+  if (INITIAL_IMAGE_URL) {
+    await sendRespondImageMessage({
+      contactId,
+      channelId,
+      imageUrl: INITIAL_IMAGE_URL,
+    }).catch((error) => {
+      console.warn(`Unable to send initial Respond image: ${error.message}`)
+    })
+  }
+
+  await sendRespondTextMessage({ contactId, channelId, text: greeting })
+  await sendRespondTextMessage({ contactId, channelId, text: stateQuestion })
+}
+
+function getInitialGreeting(customerLanguage) {
+  return (
+    INITIAL_GREETING_BY_LANGUAGE[normalizeLanguageName(customerLanguage)] ||
+    INITIAL_GREETING_BY_LANGUAGE['Latin American Spanish']
+  )
+}
+
+function getInitialStateQuestion(customerLanguage) {
+  return (
+    INITIAL_STATE_QUESTION_BY_LANGUAGE[normalizeLanguageName(customerLanguage)] ||
+    INITIAL_STATE_QUESTION_BY_LANGUAGE['Latin American Spanish']
+  )
+}
+
+async function updateRespondContactState(contactId, state) {
+  await updateRespondContact({
+    contactId,
+    fields: {
+      customFields: {
+        state,
+      },
+    },
+  }).catch((error) => {
+    console.warn(`Unable to update Respond state field: ${error.message}`)
+  })
+}
+
+async function updateRespondContactStatusAfterBooking(contactId, { throwOnError = false } = {}) {
+  return updateRespondContact({
+    contactId,
+    fields: {
+      customFields: {
+        lead_status: 'Evaluation Scheduled',
+      },
+    },
+  }).then(() => ({ ok: true })).catch((error) => {
+    if (throwOnError) throw error
+    console.warn(`Unable to update Respond Contact Status after booking: ${error.message}`)
+    return { ok: false, error: error.message }
+  })
+}
+
+async function updateRespondContactLanguage(contactId, language) {
+  const languageCode = {
+    English: 'en',
+    'Latin American Spanish': 'es',
+    Portuguese: 'pt',
+  }[normalizeLanguageName(language)]
+
+  if (!languageCode) return
+
+  await updateRespondContact({
+    contactId,
+    language: languageCode,
+  }).catch((error) => {
+    console.warn(`Unable to update Respond contact language: ${error.message}`)
+  })
+}
+
+function normalizeRespondWebhookEvent(body) {
+  const message = body.message || body.data?.message || body.messages?.[0] || body.data?.messages?.[0] || {}
+  const contact = body.contact || body.data?.contact || message.contact || {}
+  const conversation =
+    body.conversation ||
+    body.data?.conversation ||
+    contact.conversation ||
+    message.conversation ||
+    {}
+  const text = extractRespondWebhookText(message)
+  const isVoiceMessage = isRespondVoiceMessage(message)
+  const isImageMessage = isRespondImageMessage(message)
+  const isUnsupportedMessage = isRespondUnsupportedMessage(message, text)
+  const traffic = message.traffic || body.traffic || body.data?.traffic || ''
+  const direction = message.direction || body.direction || body.data?.direction || ''
+  const eventName = body.event || body.eventName || body.type || body.data?.event || ''
+  const assignee = extractRespondWebhookAssignee({
+    body,
+    contact,
+    conversation,
+    message,
+  })
+  const isOutgoing =
+    traffic === 'outgoing' ||
+    direction === 'outgoing' ||
+    /outgoing|sent|delivered|read/i.test(eventName)
+
+  return {
+    messageId: String(
+      message.id ||
+      message.messageId ||
+      message.message_id ||
+      body.messageId ||
+      body.message_id ||
+      body.data?.messageId ||
+      body.data?.message_id ||
+      '',
+    ).trim(),
+    contactId:
+      String(
+        contact.id ||
+        contact.contactId ||
+        body.contactId ||
+        body.respondContactId ||
+        body.data?.contactId ||
+        message.contactId ||
+        '',
+      ).trim(),
+    channelId:
+      message.channelId ||
+      message.channel?.id ||
+      body.channelId ||
+      body.data?.channelId ||
+      body.channel?.id ||
+      contact.channelId ||
+      contact.channel?.id ||
+      conversation.channelId ||
+      conversation.channel?.id ||
+      '',
+    contactPhone: extractRespondContactPhone(contact, getRespondCustomFieldMap(contact)),
+    attribution: extractRespondAttribution(body),
+    isIncoming: !isOutgoing,
+    eventName,
+    assignee,
+    timestamp: normalizeRespondWebhookTimestamp(
+      body.timestamp ||
+      body.createdAt ||
+      body.data?.timestamp ||
+      body.data?.createdAt ||
+      conversation.updatedAt ||
+      conversation.updated_at,
+    ),
+    isConversationAssignmentEvent:
+      /conversation[\s._-]*(?:assign|assignee)|assignee[\s._-]*(?:assign|change|update)/i.test(
+        eventName,
+      ),
+    isConversationUnassignedEvent:
+      /conversation[\s._-]*unassign|assignee[\s._-]*(?:remove|clear|unassign)/i.test(
+        eventName,
+      ),
+    isConversationClosedEvent: /conversation[\s._-]*clos|conversation[\s._-]*resolve|clos(ed|e)|resolv(ed|e)/i.test(
+      eventName,
+    ),
+    skipReason: isOutgoing ? 'Ignoring outbound Respond message.' : '',
+    isVoiceMessage,
+    isImageMessage,
+    isUnsupportedMessage,
+    text,
+  }
+}
+
+function extractRespondAttribution(body = {}) {
+  const candidates = []
+  walkAttributionValues(body, candidates)
+  const field = (...patterns) => {
+    const match = candidates.find(({ key, value }) => patterns.some((pattern) => pattern.test(key)) && value)
+    return match?.value || ''
+  }
+  const serialized = JSON.stringify(body).slice(0, 50000)
+  const platform = /facebook|instagram|fbclid|["':\s]meta(?:["',}\s]|$)/i.test(serialized)
+    ? 'meta'
+    : /tiktok|ttclid/i.test(serialized) ? 'tiktok' : field(/platform/, /channel_name/, /source/)
+  const adId = field(/(?:^|\.)ad_?id$/, /advertisement_?id/, /referral.*ad.*id/)
+  const adUrl = field(/ad_?url/, /referral_?url/, /source_?url/)
+  const type = adId || adUrl || /clicked.{0,40}(facebook|instagram|tiktok).{0,20}ad|through an ad/i.test(serialized)
+    ? 'paid_ad' : ''
+
+  return Object.fromEntries(Object.entries({
+    platform,
+    type,
+    adId,
+    adName: field(/ad_?name/, /advertisement_?name/),
+    adUrl,
+    campaignId: field(/campaign_?id/),
+    campaignName: field(/campaign_?name/),
+  }).filter(([, value]) => Boolean(value)))
+}
+
+function walkAttributionValues(value, output, path = '', depth = 0) {
+  if (!value || depth > 7 || output.length > 500) return
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => walkAttributionValues(item, output, `${path}.${index}`, depth + 1))
+    return
+  }
+  if (typeof value !== 'object') return
+  for (const [key, nested] of Object.entries(value)) {
+    const fullKey = `${path}.${key}`.toLowerCase()
+    if (['string', 'number'].includes(typeof nested)) output.push({ key: fullKey, value: String(nested) })
+    else walkAttributionValues(nested, output, fullKey, depth + 1)
+  }
+}
+
+function mergeRespondAttribution(existing = {}, incoming = {}) {
+  return Object.fromEntries(Object.entries({ ...existing, ...incoming }).filter(([, value]) => Boolean(value)))
+}
+
+function isRespondVoiceMessage(message = {}) {
+  const typeCandidates = [
+    message.type,
+    message.messageType,
+    message.message_type,
+    message.contentType,
+    message.content_type,
+    message.message?.type,
+    message.attachment?.type,
+    message.attachments?.[0]?.type,
+    message.audio?.type,
+    message.media?.type,
+    message.file?.type,
+    message.message?.contentType,
+    message.message?.content_type,
+    message.message?.attachment?.type,
+    message.message?.attachments?.[0]?.type,
+  ]
+  const mimeCandidates = [
+    message.mimeType,
+    message.mime_type,
+    message.attachment?.mimeType,
+    message.attachment?.mime_type,
+    message.attachments?.[0]?.mimeType,
+    message.attachments?.[0]?.mime_type,
+    message.audio?.mimeType,
+    message.audio?.mime_type,
+    message.media?.mimeType,
+    message.media?.mime_type,
+    message.file?.mimeType,
+    message.file?.mime_type,
+    message.message?.mimeType,
+    message.message?.mime_type,
+    message.message?.attachment?.mimeType,
+    message.message?.attachment?.mime_type,
+    message.message?.attachments?.[0]?.mimeType,
+    message.message?.attachments?.[0]?.mime_type,
+  ]
+  const fileCandidates = [
+    message.url,
+    message.fileName,
+    message.file_name,
+    message.attachment?.url,
+    message.attachment?.fileName,
+    message.attachment?.file_name,
+    message.attachments?.[0]?.url,
+    message.attachments?.[0]?.fileName,
+    message.attachments?.[0]?.file_name,
+    message.audio?.url,
+    message.media?.url,
+    message.file?.url,
+    message.file?.name,
+    message.message?.attachment?.url,
+    message.message?.attachments?.[0]?.url,
+  ]
+
+  return (
+    typeCandidates.some((value) => /^(audio|voice|voice_message|voice_note|audio_message|ptt)$/i.test(String(value || '').trim())) ||
+    mimeCandidates.some((value) => /^audio\//i.test(String(value || '').trim())) ||
+    fileCandidates.some((value) => /\.(?:aac|amr|m4a|mp3|oga|ogg|opus|wav|webm)(?:\?|#|$)/i.test(String(value || '').trim())) ||
+    Boolean(message.audio && typeof message.audio === 'object')
+  )
+}
+
+function extractRespondWebhookAssignee({ body = {}, contact = {}, conversation = {}, message = {} } = {}) {
+  const candidates = [
+    conversation.assignee,
+    conversation.assignedTo,
+    conversation.assigned_to,
+    conversation.assigneeEmail,
+    conversation.assignee_email,
+    body.assignee,
+    body.data?.assignee,
+    contact.assignee,
+    message.assignee,
+  ]
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' || typeof candidate === 'number') {
+      const value = String(candidate).trim()
+      if (value) return value
+    }
+
+    if (candidate && typeof candidate === 'object') {
+      const value = String(
+        candidate.email ||
+        candidate.id ||
+        candidate.userId ||
+        candidate.user_id ||
+        candidate.name ||
+        '',
+      ).trim()
+      if (value) return value
+    }
+  }
+
+  return ''
+}
+
+function normalizeRespondWebhookTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 1e12 ? value * 1000 : value
+  }
+
+  const parsed = Date.parse(String(value || ''))
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function extractRespondWebhookText(message) {
+  const candidates = [
+    message.text,
+    message.message?.text,
+    message.message?.body,
+    message.body,
+    message.content,
+    message.message,
+  ]
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim()
+    }
+  }
+
+  return ''
+}
+
+function preventUnconfirmedBookingReply(text, customerLanguage, messages = [], session = {}) {
+  if (hasCustomerAvailabilityQuestion(text) && hasBookingContext({ messages, session })) {
+    return bookingCopy(customerLanguage, 'checking')
+  }
+
+  if (!hasUnconfirmedBookingLanguage(text)) {
+    return text
+  }
+
+  const details = extractRespondBookingDetails(messages)
+  const phoneIsKnown = hasKnownRespondBookingPhone({
+    conversationPhone: details.phone,
+    bookingPhone: session?.booking?.details?.phone,
+    profilePhone: session?.respondContactProfile?.bookingDetails?.phone,
+  })
+
+  if (phoneIsKnown) {
+    // Phone is known; slot will be offered by the booking automation — show checking copy
+    return bookingCopy(customerLanguage, 'checking')
+  }
+
+  if (normalizeLanguageName(customerLanguage) === 'Latin American Spanish') {
+    return 'Por favor enviame el mejor numero de telefono para la llamada. 📲'
+  }
+
+  return 'Please send the best phone number for the call. 📲'
+}
+
+function hasCustomerAvailabilityQuestion(text) {
+  const normalized = normalizeSearchText(text)
+
+  return [
+    /\b(what|which)\b[\s\S]{0,40}\b(day|date|time)\b[\s\S]{0,40}\b(work|works|available|free|best)\b/,
+    /\bwhen\b[\s\S]{0,60}\b(available|free|work|works)\b/,
+    /\bbest\b[\s\S]{0,30}\b(day|date|time|availability)\b/,
+    /\bque\b[\s\S]{0,40}\b(dia|fecha|hora|horario)\b[\s\S]{0,40}\b(conviene|funciona|disponible)\b/,
+    /\bcuando\b[\s\S]{0,50}\b(disponible|puedes|podrias|te funciona)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function hasBookingContext({ messages = [], session = {} }) {
+  const details = {
+    ...(session.booking?.details || {}),
+    ...extractRespondBookingDetails(messages),
+  }
+  const booking = session.booking || {}
+
+  return Boolean(
+    booking.pendingField ||
+    booking.offeredOption ||
+    booking.options?.length ||
+    details.state ||
+    details.desiredTreatment ||
+    details.phone ||
+    messages.some((item) => item.role === 'user' && isBookingRequest(item.content || '')),
+  )
+}
+
+
+function hasUnconfirmedBookingLanguage(text) {
+  const normalized = String(text || '').toLowerCase()
+
+  return [
+    /\b(booked|scheduled|confirmed|reserved|set)\b[\s\S]{0,80}\b(today|tomorrow|mon|tue|wed|thu|fri|sat|sun|am|pm|est|edt|\d{1,2}:\d{2})\b/,
+    /\b(call|appointment|discovery call)\s+is\s+set\b/,
+    /\b(i|we)\s+(will|can|shall)\s+send\b[\s\S]{0,80}\b(appointment|details|link|invite)\b/,
+    /\b(i|we)\s+(sent|send|have sent)\b[\s\S]{0,80}\b(appointment|details|link|invite|invitation)\b/,
+    /\b(te|le)\s+(envie|envi[eé]|mande|mand[eé])\b[\s\S]{0,80}\b(enlace|link|detalles|invitacion|invitaci[oó]n)\b/,
+    /\b(enlace|link|detalles|invitacion|invitaci[oó]n)\b[\s\S]{0,80}\b(enviado|sent)\b/,
+    /\b(proceed|go ahead|move forward)\b[\s\S]{0,80}\b(setting up|scheduling|booking|confirming)\b/,
+    /\b(check|checking|verify|verifying)\b[\s\S]{0,100}\b(next available|availability|available|calendar|booking|appointment|slot|time)\b/,
+    /\bsubmit\b[\s\S]{0,80}\b(booking|form|reservation|appointment)\b/,
+    /\b(i|we)\s+have\s+availability\b[\s\S]{0,80}\b(today|tomorrow|am|pm|est|edt|\d{1,2}:\d{2})\b/,
+    /\bavailable slot\b[\s\S]{0,80}\b(today|tomorrow|am|pm|est|edt|\d{1,2}:\d{2})\b/,
+    /\b(confirm|confirmar|confirme|schedule|book|agendar|agendare|agendar[eÃ©]|programar)\b[\s\S]{0,120}\b(cita|appointment|llamada|call)\b/,
+    /\b(te|le)\s+(agendo|agendare|agendar[eÃ©]|confirmo|confirmare|confirmar[eÃ©])\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function buildInstructions({ agent, instructions, customerLanguage, redundancyControl }) {
+  return [
+    agent?.systemPrompt,
+    customerLanguage
+      ? `Reply language target: ${customerLanguage}. Answer this reply in ${customerLanguage}, because it matches the latest customer language or the best available fallback. If the customer switches languages in a later message, follow that latest customer language. Do not switch languages because retrieved examples, company context, prior agent messages, or internal notes use another language.`
+      : '',
+    redundancyControl,
+    'Redundancy control is mandatory: do not ask for a detail the customer already provided in this conversation, and do not repeat prices, product lists, or onboarding explanations already shown unless the customer explicitly asks for them again. If a prior agent message asked for multiple details and the customer supplied one of them, acknowledge the supplied detail and ask only for the missing detail.',
+    'For booking qualification, default the customer goal to weight loss. After collecting state, move directly to availability or the next required booking detail. Do not ask a separate main-goals question unless the customer asks for help comparing non-weight-loss options.',
+    'Use retrieved company knowledge as supporting context when it is relevant. Do not mention internal source names unless asked. If context is missing, ask a clarifying question or route to a human instead of inventing facts.',
+    'Retrieved examples are examples of workflow only. They never override the reply language target.',
+    'Numbered-option language rule: if the complete customer message is 1, 2, 3, option 1, option 2, or option 3, treat that reply as Latin American Spanish. Do not apply this rule to another number or to time expressions such as 1pm or 1 pm.',
+    'When retrieved raw conversation examples are relevant, mirror their decision pattern and workflow, but do not copy the example language. Always answer in the customer’s current language. Do not expose internal notes or claim the example conversation is part of the current chat.',
+    'Speak for Dharma in first person plural. Use "we", "our clinic", "we are located", and "we offer" instead of third-person wording like "Dharma Clinic is..." or "Dharma offers..." unless a legal or source quote requires the formal name.',
+    'Vary your wording naturally. Do not repeat the customer exact phrasing back to them unless needed for clarity. Use the contact name sparingly when known, mainly in the first warm greeting or after a longer gap. Do not use the name in consecutive replies. In an ongoing conversation, do not start routine replies with a fresh greeting such as "Hi", "Hello", "Hola", or "Olá"; just answer the message.',
+    'Mid-flow question rule: if the customer asks any simple or complex question while a slot or booking step is active, answer directly without a greeting, then return to the same current booking step in a separate short paragraph. Preserve the active offered slot, pending phone/name/state request, and language. Do not reset the conversation, and do not ask whether they have more questions before booking.',
+    'Emoji style for model-generated chat replies: use emojis sparingly and intentionally. Include at most one friendly, relevant emoji in normal customer-facing sales replies, such as 📍 for state, 📲 for phone, 💛 for warmth, or ✨ for encouragement. Do not use decorative emoji strings, do not add multiple emojis, and do not add emojis to serious privacy, medical, safety, refund, complaint, or legal-policy answers unless a fixed application template already includes one. This rule applies only to generated chat replies; do not rewrite or add emojis to fixed application templates.',
+    'If a polite lead says they are not interested, says no thank you, asks to talk later, or says another time, ask whether they have any questions or concerns you can answer before booking or before they go. Keep it warm and do not immediately close the conversation.',
+    'Guide the lead through the best next step instead of asking them to choose a meeting type. If the customer mentions breastfeeding, pregnancy, side effects, medical conditions, or anything that may make injections inappropriate, do not push injections. Offer nutrition guidance, supplements, or routing to a specialist, and recommend licensed medical guidance for clinical decisions.',
+    'Conversation flexibility rule: the booking/state/product flow is important, but customers may ask unrelated or clarifying questions at any point. Answer their question first using available knowledge, then naturally return to the next missing flow step when appropriate. If they ask "what is it about?", "tell me more", "how does it work", pricing, product, company, safety, side-effect, or similar questions while a slot or flow step is active, answer that question before asking them to choose or confirm. Do not repeat a fixed qualification template just because the contact has an out-of-state value saved. When returning to scheduling, never ask what day or time works best for the customer; instead say you will check the next available time or continue collecting the next required booking detail so the application can offer real calendar slots.',
+    'Appointments are always online discovery calls, never in-person consultations. The discovery call is a 20-minute video call. At the agreed appointment time, the specialist can call the customer on their regular phone number, or the customer can join using the video-call link sent a few minutes before the appointment. If the customer asks what the discovery call is about or whether it is a phone or video call, explain both connection options clearly. If the customer asks whether the appointment or discovery call costs money, answer clearly that the discovery call is free and the specialist will explain treatment options, pricing, and next steps during the call.',
+    'When offering a discovery call, offer a real available slot from the booking calendar or ask the application/team to check availability. Never ask generally for the customer best availability as the primary next step.',
+    'For new clients, offer the real appointment time before asking for their full name. After they accept the offered time, collect the full name and any other missing required booking detail while preserving that accepted slot.',
+    'Offer only one appointment option at a time unless the application explicitly provides numbered options. Preserve the customer latest date preference when they refine time; for example, if they said tomorrow and then ask for afternoon or 5pm, keep searching tomorrow, not today.',
+    'HIGH-PRIORITY AVAILABILITY RULE: Treat every customer availability statement as a binding constraint for the rest of the current chat. If they reject only an offered time earlier in the day, offer a later real calendar slot. If the rejected slot is at or after 4:00 PM and close to the 7:00 PM business-hours cutoff, offer the latest real remaining calendar slot before closing; if none remains that day, offer the next valid day. Never calculate, mention, or accept a time that was not returned by the booking calendar. If they reject today or a named day/date, offer the next available calendar day after it; and if they specify morning, afternoon, evening, or a weekday such as Saturdays only, remember and apply that restriction to every later offer until the customer changes it. Never repeat the rejected time or offer a slot that conflicts with the stored restriction.',
+    'Never claim that an appointment is booked, scheduled, confirmed, reserved, or that a link/details were sent unless the application booking flow has already returned a successful booking confirmation.',
+    'For Respond webhook conversations, do not invent appointment availability. If there is no explicit booking-calendar availability or booking confirmation in the application context, collect the missing booking details instead. The customer phone is required before booking. Never narrate internal workflow or backend implementation details to customers.',
+    'Never ask for the customer full address or shipping address during lead qualification or discovery-call booking. State is enough for delivery qualification.',
+    'When the customer is in the booking flow or gives scheduling intent, do not ask whether they need more information before booking. Continue to the next missing booking detail or offer a real available calendar slot.',
+    'Never confirm refunds, replacements, credits, or compensation in complaint cases. Ask for the order details, issue, photos if relevant, and route the customer to a call or Customer Care.',
+    'Use the Respond contact profile context when present. If a customer first name is provided, use only the first name and use it sparingly. Prefer no name in routine booking, slot, and follow-up messages, especially if the prior agent reply already used it. If the identifier is returning_client, treat them as an existing client and route support/client-care needs appropriately. If it is returning_lead, existing_hubspot_contact, or returning_conversation, acknowledge continuity naturally and avoid acting like they are brand new. If it is new_or_no_record, continue the normal new-lead flow. Never reveal internal field names, tags, IDs, or classification labels to the customer.',
+    'Booking routing rule: contacts whose Respond Contact Status field is exactly "Client" or "Evaluation Scheduled" are booked only with the CS Team. Never book these contacts with a seller. All other contact statuses use the new-client booking pool. Do not tell the customer this internal routing logic. A visible WhatsApp or Respond contact name may be used conversationally, but it does not confirm the booking name for new-client contacts. Require them to provide at least a first name and last name in the chat before booking. If the customer replies with only one name, ask again for their full name and do not proceed until both name parts are provided.',
+    'If a contact says they are already a client, route them to Customer Care. If they ask to speak with doctors or have side effects/medical questions and they are a current prescribed-treatment client, send them to the patient portal: https://telehealth.dharmanutritionclinic.com/dharmanutritionclinic/login. Tell them to log in, go to Messages, then Care Team.',
+    'Use "Semaglutide" and "Tirzepatide" for injection names. Do not use "Ozempic" or "Mounjaro" as Dharma product names. If asked about FDA approval, do not say compounded Semaglutide or compounded Tirzepatide are FDA-approved. Explain that FDA-approved branded medications include Wegovy and Zepbound, and Dharma uses the same active compounds with licensed medical oversight when appropriate.',
+    'Dharma works with GHK-Cu. If a customer asks whether we carry or work with GHK-Cu, answer yes, then explain that during the free discovery call our specialist can explain the available options, how they work, and whether they fit the customer goals. Do not invent a format, price, benefit, dosage, shipping rule, or eligibility claim.',
+    'Price follow-up rule: whenever the customer asks about treatment price or cost, answer directly without a greeting and say only that there is a plan in the $589 range. Do not provide any other price, price list, starting price, or product-specific price in chat, even if the customer names Semaglutide or Tirzepatide or asks for all options. Explain that during the free discovery call, the specialist will give them the other prices and review the available options based on what they need so the plan can be tailored to them. Never invent monthly financing amounts, dosage advice, or recommend one product. Never ask for state if the booking context already shows a Known state. If a real slot is already active, briefly return to that slot after answering. If state is known but no slot is active, let the application append real availability for the following day. Ask for state only when the booking context has no Known state.',
+    'If the customer says the treatment is expensive, explain that the price is for the complete treatment, payment plans may be available with biweekly or monthly payments, accepted payment methods may include debit card, credit card, Venmo, Zelle, Afterpay, Klarna, Affirm, and CareCredit, and the treatment includes personalized attention, dose adjustments when appropriate, and nutrition/activity guidance. Keep it concise and offer a concrete discovery-call slot.',
+    `State and product qualification rule: use company knowledge for which products are deliverable in each state. If the customer is out of state for weight-loss injections, do not offer or book a prescribed-treatment appointment and do not claim injections can ship there. If they ask a general question, answer it normally in their language using company knowledge and then gently guide them toward supplements or nutrition support. Only send the exact out-of-state supplement alternative script when the customer is trying to qualify, book, buy, or ship weight-loss injections in a non-serviceable state.
+
+Spanish Template:
+💛✨ Por el momento no podemos enviar inyecciones de pérdida de peso a su estado😔.
+Pero sí podemos ayudarte con nuestra línea de suplementos Dharma, diseñados para apoyar tu proceso de forma natural:
+🔥 *Fat Burner*: acelera el metabolismo, da energía limpia y ayuda a quemar grasa durante el día.
+🟠 *Berberine*: controla antojos, reduce azúcar en sangre y baja la inflamación abdominal.
+💪 *Creatine*: mejora fuerza, tonifica más rápido y acelera la recuperación para verte más fit.
+*Puedes ver todo aquí* 👉 https://dharmanutritionclinic.com/collections/supplements
+
+English Template:
+💛✨ At the moment, we cannot ship weight loss injections to your state 😔.
+But we can help you with our Dharma supplement line, designed to support your journey naturally:
+🔥 *Fat Burner*: speeds up metabolism, provides clean energy, and helps burn fat throughout the day.
+🟠 *Berberine*: controls cravings, reduces blood sugar, and lowers abdominal inflammation.
+💪 *Creatine*: improves strength, tones faster, and speeds up recovery so you look more fit.
+*You can view everything here* 👉 https://dharmanutritionclinic.com/collections/supplements
+
+Portuguese Template:
+💛✨ No momento, não podemos enviar injeções de perda de peso para o seu estado😔.
+Mas podemos ajudá-lo com nossa linha de suplementos Dharma, desenvolvida para apoiar seu processo de forma natural:
+🔥 *Fat Burner*: acelera o metabolismo, dá energia limpa e ajuda a queimar gordura durante o dia.
+🟠 *Berberine*: controla os desejos, reduz o açúcar no sangue e diminui a inflamação abdominal.
+💪 *Creatine*: melhora a força, tonifica mais rápido e acelera a recuperação para você ficar mais fit.
+*Você pode ver tudo aqui* 👉 https://dharmanutritionclinic.com/collections/supplements`,
+    'Never refer to Dharma sellers/treatment specialists as doctors or medical doctors. Call them "specialists in our treatments", "treatment specialists", or "nutritionists" when appropriate, not "medical specialists". If a customer asks about the doctor, provider, or medical review while state collection or appointment booking is active, answer that question first, then return to the current flow step in a separate short paragraph. In the customer language, explain that Dharma works with a network of licensed providers in the states where we offer care; after the customer completes the medical form, their case is assigned to a licensed doctor in their state, using the known state name when available, such as California; during the free analysis call, our specialist explains treatment options, the process, and answers questions.',
+    'Do not disclose or imply any client, celebrity, or public figure treatment details, including Dayanara Torres. If asked whether a client or public figure used a specific treatment, do not mention or repeat the specific treatment name. Say privacy rules prevent sharing any client treatment information, then offer to explain Dharma treatment options according to the customer goal.',
+    'Teachable rule: When a customer asks what medication or treatment we offer generally—or clarifies that they are not asking about a person—answer with our general Semaglutide and Tirzepatide options, never use the client-privacy script, and then return to the active booking step.',
+    'When discussing trust or legitimacy, say Dharma Clinic is LegitScript-certified and has more than 1500 positive Google reviews.',
+    'Do not ask for the customer name before you have handled their question and appointment timing or availability context. Keep replies concise: answer the customer question first, then ask one follow-up in a separate short paragraph.',
+    'Before suggesting leaving the conversation for another day, ask whether the customer has any other questions or concerns you can answer now.',
+    'Flow recovery rule: when the conversation falls back to a model answer, RAG answer, knowledge-base answer, complex question, or general question, preserve the complete active booking context. After the answer, use one subtle bridge back to the exact pending step: ask for state if state is pending, phone if phone is pending, name if name is pending after slot acceptance, or re-offer the active slot if a slot is awaiting acceptance. Never discard or replace an offered/accepted slot, skip ahead, or ask for a new detail before the current pending step is satisfied.',
+    'When the customer asks what Semaglutide or Tirzepatide is, explain that we offer weight-loss injections that help reduce appetite and burn body fat. Keep it brief, avoid clinical certainty, and mention that eligibility is reviewed by the provider/specialist process.',
+    'When the customer asks how long injections take to work or when effects/results appear, answer first: many people notice appetite reduction in the first few weeks, but timing varies by body, dose, and plan. Then explain that the specialist guides them through how it works, what to expect, and next steps during the free call. After that, return to the current booking step.',
+    'The client/privacy rule applies to any named person, not only celebrities or known clients. If asked whether a specific client, celebrity, public figure, or named person used a treatment, use the same client-privacy answer first, then return to booking. Do not ask for phone, name, state, or any booking detail before answering the privacy question.',
+    'HIPAA/privacy rule: never encourage customers to share specific medical conditions, diagnoses, medication lists, or medical history in chat. If they mention a condition or ask if they can use injections, explain that the specialist will review all medical conditions and contraindications during the discovery call to make sure treatment is safe for them. Do not ask them to describe the condition in chat.',
+    instructions,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+    .trim()
+}
+
+function buildInput({
+  messages = [],
+  context,
+  message,
+  customerLanguage,
+  redundancyControl,
+  respondContactProfile,
+  booking,
+}) {
+  const parts = []
+
+  if (customerLanguage) {
+    parts.push(`Reply language target for the next reply: ${customerLanguage}`)
+  }
+
+  if (redundancyControl) {
+    parts.push(redundancyControl)
+  }
+
+  if (respondContactProfile) {
+    parts.push(formatRespondContactProfileForPrompt(respondContactProfile))
+  }
+
+  if (booking) {
+    parts.push(formatBookingContextForPrompt(booking))
+  }
+
+  if (context) {
+    parts.push(`Relevant company context:\n${context}`)
+  }
+
+  if (message) {
+    parts.push(`Customer message:\n${message}`)
+  }
+
+  if (messages.length > 0) {
+    const conversation = messages
+      .map((item) => `${item.role || 'user'}: ${item.content || ''}`)
+      .join('\n')
+
+    parts.push(`Conversation:\n${conversation}`)
+  }
+
+  return parts.join('\n\n').trim() || 'Start the conversation with a helpful greeting.'
+}
+
+function buildRedundancyControl({ messages = [] }) {
+  if (!messages.length) {
+    return ''
+  }
+
+  const userMessages = messages.filter((item) => item.role === 'user').map((item) => item.content || '')
+  const agentMessages = messages.filter((item) => item.role === 'agent').map((item) => item.content || '')
+  const knownDetails = extractKnownCustomerDetails(userMessages)
+  const shownTopics = extractShownAgentTopics(agentMessages)
+  const priorQuestions = extractPriorQuestions(agentMessages)
+  const lines = [
+    'Redundancy control context:',
+    knownDetails.length ? `Known customer details: ${knownDetails.join('; ')}` : '',
+    shownTopics.length ? `Already shown by agent: ${shownTopics.join('; ')}` : '',
+    priorQuestions.length ? `Questions already asked: ${priorQuestions.join(' | ')}` : '',
+    'Next reply should advance the conversation with only the missing next step.',
+  ].filter(Boolean)
+
+  return lines.length > 2 ? lines.join('\n') : ''
+}
+
+function extractKnownCustomerDetails(userMessages) {
+  const details = []
+  const joined = userMessages.join('\n')
+  const email = joined.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]
+  const phone = joined.match(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4,}/)?.[0]
+  const state = [...userMessages].reverse().map(extractStateName).find(Boolean)
+  const language = extractPreferredLanguageName(joined)
+  const preferredTime = extractPreferredTimeText(joined)
+  const desiredTreatment = extractDesiredTreatmentName(joined)
+  const likelyName = [...userMessages].reverse().map(cleanLikelyName).find((text) => {
+    const trimmed = text.trim()
+    return isLikelyCustomerName(trimmed)
+  })
+
+  if (state) {
+    details.push(`state=${state}`)
+  }
+
+  if (preferredTime) {
+    details.push(`preferred time=${preferredTime}`)
+  }
+
+  if (desiredTreatment) {
+    details.push(`desired treatment=${desiredTreatment}`)
+  }
+
+  if (likelyName) {
+    details.push(`name=${likelyName.trim()}`)
+  }
+
+  if (phone) {
+    details.push(`phone=${phone}`)
+  }
+
+  if (email) {
+    details.push(`email=${email}`)
+  }
+
+  if (language) {
+    details.push(`preferred language=${language}`)
+  }
+
+  return details
+}
+
+function extractShownAgentTopics(agentMessages) {
+  const joined = agentMessages.join('\n').toLowerCase()
+  const topics = []
+
+  if (/\$\s*499|glp-?1/.test(joined)) {
+    topics.push('GLP-1 package price/details')
+  }
+
+  if (/\$\s*299|zepbound/.test(joined)) {
+    topics.push('Zepbound prescription access price/details')
+  }
+
+  if (/free|gratuita|gratuito/.test(joined) && /call|consulta|consultation|videollamada/.test(joined)) {
+    topics.push('free consultation call')
+  }
+
+  if (/instagram|@dharma\.clinic/.test(joined)) {
+    topics.push('Instagram intro')
+  }
+
+  return topics
+}
+
+function cleanLikelyName(content) {
+  const email = content.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || ''
+  const phone = content.match(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4,}/)?.[0] || ''
+
+  return content.replace(email, '').replace(phone, '').split(',')[0].trim()
+}
+
+function extractPriorQuestions(agentMessages) {
+  return agentMessages
+    .flatMap((message) => message.match(/[^.!?\n]*\?/g) || [])
+    .map((question) => question.trim())
+    .filter(Boolean)
+    .slice(-6)
+}
+
+function extractStateName(content) {
+  const normalized = normalizeSearchText(content)
+  const translatedState = getCanonicalStateAlias(content)
+  const fullStateName = US_STATES.find((state) => {
+    const normalizedState = normalizeSearchText(state)
+    return new RegExp(`\\b${escapeRegExp(normalizedState)}\\b`).test(normalized)
+  })
+  const aliases = new Map([
+    ['dc', 'District of Columbia'],
+    ['d c', 'District of Columbia'],
+    ['pr', 'Puerto Rico'],
+    ['washington dc', 'District of Columbia'],
+    ['washington d c', 'District of Columbia'],
+  ])
+  if (translatedState) {
+    return translatedState
+  }
+
+  // Complete state names are stronger evidence than two-letter tokens. This
+  // prevents Spanish connector words such as "de" from overriding "Texas".
+  if (fullStateName) {
+    return fullStateName
+  }
+
+  const abbreviationState = extractStateNameFromAbbreviation(content)
+
+  if (abbreviationState) {
+    return abbreviationState
+  }
+
+  for (const [alias, state] of aliases.entries()) {
+    if (new RegExp(`\\b${escapeRegExp(alias)}\\b`).test(normalized)) {
+      return state
+    }
+  }
+
+  return (
+    findStateNameWithMinorTypo(content, US_STATES) ||
+    extractNonServiceableLocationName(content) ||
+    ''
+  )
+}
+
+export function inferStateFromCity(content) {
+  const normalized = normalizeSearchText(content)
+  const cityStates = Object.entries(CITY_STATE_OPTIONS).sort(
+    ([leftCity], [rightCity]) => rightCity.length - leftCity.length,
+  )
+
+  for (const [cityKey, states] of cityStates) {
+    const city = cityKey.replace(/_/g, ' ')
+
+    if (new RegExp(`\\b${escapeRegExp(city)}\\b`).test(normalized)) {
+      const displayCity = toTitleCase(city === 'nyc' ? 'New York City' : city.replace(/\bd c\b/, 'DC'))
+
+      if (states.length > 1) {
+        return {
+          city: displayCity,
+          states,
+          ambiguous: true,
+        }
+      }
+
+      return {
+        city: displayCity,
+        state: states[0],
+      }
+    }
+  }
+
+  return null
+}
+
+function toTitleCase(value) {
+  return String(value || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => (word === 'DC' ? word : `${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`))
+    .join(' ')
+}
+
+function extractStateNameFromAbbreviation(content) {
+  const stateAbbreviations = new Map([
+    ['AL', 'Alabama'],
+    ['AK', 'Alaska'],
+    ['AZ', 'Arizona'],
+    ['AR', 'Arkansas'],
+    ['CA', 'California'],
+    ['CO', 'Colorado'],
+    ['CT', 'Connecticut'],
+    ['DE', 'Delaware'],
+    ['DC', 'District of Columbia'],
+    ['FL', 'Florida'],
+    ['GA', 'Georgia'],
+    ['HI', 'Hawaii'],
+    ['ID', 'Idaho'],
+    ['IL', 'Illinois'],
+    ['IN', 'Indiana'],
+    ['IA', 'Iowa'],
+    ['KS', 'Kansas'],
+    ['KY', 'Kentucky'],
+    ['LA', 'Louisiana'],
+    ['ME', 'Maine'],
+    ['MD', 'Maryland'],
+    ['MA', 'Massachusetts'],
+    ['MI', 'Michigan'],
+    ['MN', 'Minnesota'],
+    ['MS', 'Mississippi'],
+    ['MO', 'Missouri'],
+    ['MT', 'Montana'],
+    ['NE', 'Nebraska'],
+    ['NV', 'Nevada'],
+    ['NH', 'New Hampshire'],
+    ['NJ', 'New Jersey'],
+    ['NM', 'New Mexico'],
+    ['NY', 'New York'],
+    ['NC', 'North Carolina'],
+    ['ND', 'North Dakota'],
+    ['OH', 'Ohio'],
+    ['OK', 'Oklahoma'],
+    ['OR', 'Oregon'],
+    ['PA', 'Pennsylvania'],
+    ['PR', 'Puerto Rico'],
+    ['RI', 'Rhode Island'],
+    ['SC', 'South Carolina'],
+    ['SD', 'South Dakota'],
+    ['TN', 'Tennessee'],
+    ['TX', 'Texas'],
+    ['UT', 'Utah'],
+    ['VT', 'Vermont'],
+    ['VA', 'Virginia'],
+    ['WA', 'Washington'],
+    ['WV', 'West Virginia'],
+    ['WI', 'Wisconsin'],
+    ['WY', 'Wyoming'],
+  ])
+  const tokenMatches = String(content || '').matchAll(/(^|[^A-Za-z])([A-Za-z]{2})(?=$|[^A-Za-z])/g)
+
+  for (const match of tokenMatches) {
+    const rawToken = match[2]
+    const abbreviation = rawToken.toUpperCase()
+    const state = stateAbbreviations.get(abbreviation)
+
+    if (!state) {
+      continue
+    }
+
+    if (!shouldAcceptStateAbbreviationToken({ rawToken, abbreviation, content })) {
+      continue
+    }
+
+    return state
+  }
+
+  return ''
+}
+
+function extractNonServiceableLocationName(content) {
+  const normalized = normalizeSearchText(content)
+
+  return (
+    NON_SERVICEABLE_LOCATIONS.find((location) => {
+      const normalizedLocation = normalizeSearchText(location)
+
+      return new RegExp(`\\b${escapeRegExp(normalizedLocation)}\\b`).test(normalized)
+    }) || ''
+  )
+}
+
+function extractPreferredLanguageName(content) {
+  const normalized = content.toLowerCase()
+
+  if (normalized.includes('spanish') || normalized.includes('espanol')) {
+    return 'Latin American Spanish'
+  }
+
+  if (normalized.includes('portuguese') || normalized.includes('portugues')) {
+    return 'Portuguese'
+  }
+
+  if (normalized.includes('english') || normalized.includes('ingles')) {
+    return 'English'
+  }
+
+  return ''
+}
+
+function extractPreferredTimeText(content) {
+  const preferenceText =
+    extractExplicitAvailabilityAlternative(content) ||
+    getPositiveAvailabilityPreferenceText(content)
+
+  if (!preferenceText) {
+    return ''
+  }
+
+  const requestedMonthDay = extractAvailabilityMonthDay(preferenceText)
+
+  if (requestedMonthDay) {
+    const dayPart = extractPreferredClockOrDayPart(preferenceText)
+    return `${requestedMonthDay.name} ${requestedMonthDay.day}${dayPart ? ` ${dayPart}` : ''}`
+  }
+
+  const requestedMonth = extractAvailabilityMonth(preferenceText)
+
+  if (requestedMonth) {
+    return requestedMonth.name
+  }
+
+  const dateTimeMatch = preferenceText.match(
+    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+(?:at\s+)?)?(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?(?:\s+(?:at\s+)?)?(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/i,
+  )
+
+  if (dateTimeMatch) {
+    return dateTimeMatch[0].trim()
+  }
+
+  const timeMatch = preferenceText.match(/\b(?:1[0-2]|0?[1-9])(?:[:.]\d{2})?\s*(?:am|pm)\b/i)
+
+  if (timeMatch) {
+    return timeMatch[0]
+  }
+
+  const ordinalDayMatch = preferenceText.match(/\b\d{1,2}(?:st|nd|rd|th)\b/i)
+
+  if (ordinalDayMatch) {
+    return ordinalDayMatch[0]
+  }
+
+  const weekdayPreference = extractWeekdayPreferenceText(preferenceText)
+  const weekdayDayPart = extractPreferredClockOrDayPart(preferenceText)
+
+  if (weekdayPreference) {
+    return `${weekdayPreference}${weekdayDayPart ? ` ${weekdayDayPart}` : ''}`
+  }
+
+  const pluralWeekendMatch = preferenceText.match(/\b(saturdays?|sabados?|sábados?)\b/iu)
+
+  if (pluralWeekendMatch) {
+    return pluralWeekendMatch[0]
+  }
+
+  const weekdayDayPartMatch = preferenceText.match(
+    /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s+(morning|afternoon|evening)\b/i,
+  )
+
+  if (weekdayDayPartMatch) {
+    return weekdayDayPartMatch[0]
+  }
+
+  const weekdayMatch = preferenceText.match(
+    /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|segunda|terca|terça|quarta|quinta|sexta)\b/i,
+  )
+
+  if (weekdayMatch) {
+    return weekdayMatch[0]
+  }
+
+  return ''
+}
+
+function extractWeekdayPreferenceText(content = '') {
+  const normalized = normalizeSearchText(content)
+  const pattern = /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|jueves|viernes|sabado|segunda|terca|quarta|quinta|sexta)\b/g
+  const matches = [...normalized.matchAll(pattern)]
+    .filter((match) => {
+      const nearby = normalized.slice(Math.max(0, match.index - 18), match.index + match[0].length + 18)
+      return !/\b(work|working|trabajo|trabajar|trabalho|trabalhar)\b/.test(nearby)
+    })
+    .map((match) => match[0])
+  const unique = [...new Set(matches)]
+
+  return unique.join(' or ')
+}
+
+function extractPhoneNumber(content) {
+  const usPhone = extractUsPhoneNumber(content)
+
+  if (usPhone) {
+    return usPhone
+  }
+
+  return (
+    String(content || '').match(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4,}/)
+    ?.[0] || ''
+  )
+}
+
+function extractDesiredTreatmentName(content) {
+  const searchable = normalizeSearchText(content)
+  const compact = searchable.replace(/\s+/g, '')
+
+  if (/\b(peptide|peptides|peptidos|péptidos)\b/.test(searchable)) {
+    return 'Other peptides'
+  }
+
+  if (/\b(zep|zepbound)\b/.test(searchable)) {
+    return 'Weight Loss Injections'
+  }
+
+  if (
+    /\b(weight loss|lose weight|losing weight|slim down|slimming|fat loss|bajar de peso|perder peso|glp 1|semaglutide|tirzepatide|shot|shots|injection|injections|injectable|medication|meds)\b/.test(
+      searchable,
+    ) ||
+    /(weightloss|loseweight|losingweight|fatloss|slimdown|glp1)/.test(compact)
+  ) {
+    return 'Weight Loss Injections'
+  }
+
+  if (/\b(nutri|nutrition|nutritionist|nutritional|diet|dietitian|meal plan|food plan|consulta|asesoria nutricional|nutricion)\b/.test(searchable)) {
+    return 'Nutrition Consultation'
+  }
+
+  if (/\b(supp|supps|supplement|supplements|vitamin|vitamins|protein|collagen|greens|probiotic|suplemento|suplementos)\b/.test(searchable)) {
+    return 'Supplements'
+  }
+
+  return ''
+}
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function resolveCustomerLanguage({ messages = [], message, customerLanguage }) {
+  const providedLanguage = normalizeLanguageName(customerLanguage)
+
+  const userMessages = [
+    message || '',
+    ...[...messages].reverse().filter((item) => item.role === 'user').map((item) => item.content || ''),
+  ].filter((content) => content.trim())
+
+  for (const content of userMessages) {
+    const detectedLanguage = detectCustomerLanguage(content)
+
+    if (detectedLanguage) {
+      return detectedLanguage
+    }
+  }
+
+  return providedLanguage
+}
+
+function normalizeLanguageName(language) {
+  const normalized = String(language || '').toLowerCase()
+
+  if (normalized.includes('spanish') || normalized.includes('espanol') || normalized.includes('español')) {
+    return 'Latin American Spanish'
+  }
+
+  if (normalized.includes('portuguese') || normalized.includes('portugues') || normalized.includes('português')) {
+    return 'Portuguese'
+  }
+
+  if (normalized.includes('english') || normalized.includes('ingles') || normalized.includes('inglés')) {
+    return 'English'
+  }
+
+  return ''
+}
+
+export function detectCustomerLanguage(content) {
+  const deterministicLanguage = detectLatestMessageLanguage(content)
+
+  if (deterministicLanguage) {
+    return deterministicLanguage
+  }
+
+  const text = String(content || '').toLowerCase()
+  const normalizedText = normalizeSearchText(content)
+
+  if (!text.trim()) {
+    return ''
+  }
+
+  if (
+    /\b(precos?|quanto custa|custam|pagamento|pagamentos|parcelas?|financiamento|voce|voces|meu|minha|obrigad[oa]|ola|horario|chamada|agendamento|portugues|informacao|remedio|injecao|tratamento|pergunta|duvida|endereco)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return 'Portuguese'
+  }
+
+  if (
+    /\b(precios?|cuanto|cuantos|cuesta|cuestan|costos?|pagos?|cuotas?|financiamiento|espanol|ingles|telefono|numero|llamada|cita|agendar|informacion|medicamento|inyeccion|tratamiento|pregunta|duda|direccion|clinica|manana|aceptan?|seguro medico|hablar|hablo|voy|necesito|tienen|bajar de peso|tirzepatida)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return 'Latin American Spanish'
+  }
+
+  if (
+    /\b(prices?|costs?|pricing|payment|payments|installments?|financing|english|phone|number|call|appointment|schedule|information|medicines?|medications?|injections?|treatments?|questions?|clinic|address|doctors?|providers?)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return 'English'
+  }
+
+  const spanishSignals = [
+    '¿',
+    '¡',
+    'quiero',
+    'hola',
+    'gracias',
+    'cita',
+    'agendar',
+    'español',
+    'espanol',
+    'perder peso',
+    'buenas',
+    'estado',
+    'vivo',
+    'vives',
+    'llamada',
+    'cuanto',
+    'cual',
+    'cuales',
+    'ingles',
+    'inglés',
+    'precio',
+    'cuesta',
+    'medicamento',
+    'medicamentos',
+    'medicina',
+    'medicinas',
+    'informacion',
+    'información',
+    'ayuda',
+    'como',
+    'donde',
+    'que',
+    'hablo',
+    'hablar',
+    'voy a',
+    'aceptan',
+    'seguro medico',
+    'maÃ±ana',
+    'manana',
+    'favor',
+    'porfa',
+    'ella',
+    'hizo',
+    'tomo',
+    'tomó',
+    'solo',
+    'no entiendo',
+    'buenos dias',
+    'buenas tardes',
+    'buenas noches',
+  ]
+  const portugueseSignals = [
+    'olá',
+    'obrigado',
+    'obrigada',
+    'quero',
+    'consulta',
+    'agendar',
+    'português',
+    'portugues',
+    'perder peso',
+    'horário',
+  ]
+  const englishSignals = [
+    'hello',
+    'hi',
+    'thanks',
+    'thank you',
+    'appointment',
+    'schedule',
+    'english',
+    'weight loss',
+    'what state',
+    'i want',
+    'i wanna',
+    'wanna know',
+    'know more',
+    'how much',
+    'price',
+    'cost',
+    'help',
+    'what',
+    'where',
+    'when',
+    'how',
+    'yes',
+    'please',
+    'morning',
+    'afternoon',
+    'evening',
+    'tomorrow',
+    'today',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday',
+    "can't",
+    'cannot',
+    'can not',
+    'make it',
+  ]
+
+  if (spanishSignals.some((signal) => containsLanguageSignal(text, signal))) {
+    return 'Latin American Spanish'
+  }
+
+  if (portugueseSignals.some((signal) => containsLanguageSignal(text, signal))) {
+    return 'Portuguese'
+  }
+
+  if (englishSignals.some((signal) => containsLanguageSignal(text, signal))) {
+    return 'English'
+  }
+
+  return ''
+}
+
+function containsLanguageSignal(content, signal) {
+  const normalizedContent = normalizeSearchText(content)
+  const normalizedSignal = normalizeSearchText(signal)
+
+  return Boolean(
+    normalizedSignal &&
+    new RegExp(`(?:^|\\s)${escapeRegExp(normalizedSignal)}(?:$|\\s)`).test(normalizedContent),
+  )
+}
+
+async function buildRagContext({ agent, messages = [], message, modelIntent }) {
+  const result = await buildRagContextResult({ agent, messages, message, modelIntent })
+
+  return result.context
+}
+
+async function buildRagContextResult({ agent, messages = [], message, modelIntent }) {
+  const lastUserMessage = getLastUserMessage({ messages, message })
+
+  if (!lastUserMessage.trim()) {
+    return { context: '', matchCount: 0, query: '', sourceTypes: [] }
+  }
+
+  const plan = await planRagSearch({
+    agent,
+    messages,
+    message: lastUserMessage,
+    modelIntent,
+    fallbackQuery: lastUserMessage,
+  })
+
+  const matches = await searchKnowledge({
+    query: plan.query,
+    agentId: agent?.id || 'sales',
+    sourceTypes: plan.source_types,
+    matchCount: plan.match_count,
+  })
+
+  return {
+    context: formatKnowledgeContext(matches),
+    matchCount: matches.length,
+    query: plan.query,
+    sourceTypes: plan.source_types,
+  }
+}
+
+async function buildMemoryContext({ agent, messages = [], message }) {
+  const query = buildMemoryQuery({ messages, message })
+
+  if (!query.trim()) {
+    return ''
+  }
+
+  const matches = await searchApprovedMemories({
+    query,
+    agentId: agent?.id || 'sales',
+  })
+
+  return formatMemoryContext(matches)
+}
+
+function buildMemoryQuery({ messages = [], message }) {
+  const lastUserMessage = getLastUserMessage({ messages, message })
+  const recentConversation = messages
+    .slice(-6)
+    .map((item) => `${item.role || 'user'}: ${item.content || ''}`)
+    .join('\n')
+
+  return [lastUserMessage, recentConversation].filter(Boolean).join('\n\n')
+}
+
+function getLastUserMessage({ messages = [], message }) {
+  return (
+    message ||
+    [...messages].reverse().find((item) => item.role === 'user')?.content ||
+    ''
+  )
+}
+
+function queueMemorySuggestion({ agentId, messages, agentReply, source, metadata = {} }) {
+  suggestMemoryFromConversation({
+    agentId,
+    messages,
+    agentReply,
+    source,
+    metadata,
+  }).catch((error) => {
+    console.warn(`Memory suggestion skipped: ${error.message}`)
+  })
+}
+
+function extractOutputText(data) {
+  if (data.output_text) {
+    return data.output_text
+  }
+
+  return (
+    data.output
+      ?.flatMap((item) => item.content || [])
+      .filter((item) => item.type === 'output_text')
+      .map((item) => item.text)
+      .join('\n') || ''
+  )
+}
+
+function readJsonBody(request) {
+  return readRawBody(request).then(parseJsonBody)
+}
+
+function readRawBody(request) {
+  return new Promise((resolveBody, rejectBody) => {
+    let rawBody = ''
+
+    request.on('data', (chunk) => {
+      rawBody += chunk
+
+      if (rawBody.length > 1_000_000) {
+        request.destroy()
+        rejectBody(new Error('Request body is too large.'))
+      }
+    })
+
+    request.on('end', () => {
+      resolveBody(rawBody)
+    })
+  })
+}
+
+function parseJsonBody(rawBody) {
+  if (!rawBody) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(rawBody)
+  } catch {
+    throw new Error('Invalid JSON body.')
+  }
+}
+
+function sendJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+  })
+
+  response.end(JSON.stringify(payload))
+}
+
+function applyReportCors(request, response) {
+  const origin = String(request.headers.origin || '').trim()
+  if (!origin) return true
+
+  const allowedOrigins = String(process.env.REPORTS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim().replace(/\/$/, ''))
+    .filter(Boolean)
+
+  if (!allowedOrigins.includes(origin.replace(/\/$/, ''))) return false
+
+  response.setHeader('Access-Control-Allow-Origin', origin)
+  response.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  response.setHeader('Vary', 'Origin')
+  return true
+}

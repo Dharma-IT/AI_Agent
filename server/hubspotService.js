@@ -1,0 +1,1592 @@
+import { extractAvailabilityMonth, extractAvailabilityMonthDay } from '../src/utils/availabilityRules.js'
+
+const HUBSPOT_API_BASE_URL = 'https://api.hubapi.com'
+const EASTERN_TIMEZONE = 'America/New_York'
+const DEFAULT_DEAL_PIPELINE = '693198644'
+const DEFAULT_DEAL_STAGE = '1013987700'
+const DEFAULT_DEAL_EVALUATION_DATE_PROPERTY = 'evaluation_date_and_hour_2'
+const DEFAULT_DEAL_CREATED_BY_AI_PROPERTY = 'created_by_ai_bot'
+const DEFAULT_CONTACT_BOOKED_TIME_PROPERTY = 'date_and_time_of_last_meeting_booked'
+const DEFAULT_DEAL_NAME_PREFIX = 'Sellers'
+const DEFAULT_DISABLED_SELLER_SLUGS = ['diana-giron']
+const MIN_BOOKING_LEAD_TIME_MS = 60 * 60 * 1000
+const BOOKED_MEETING_LOOKUP_ATTEMPTS = 6
+const BOOKED_MEETING_LOOKUP_DELAY_MS = 1000
+const BOOKED_MEETING_START_TOLERANCE_MS = 5 * 60 * 1000
+const DEFAULT_POST_BOOKING_WORKFLOW_ID = '1660572815'
+
+const PRIORITY_SELLERS = [
+  { slug: 'meribet-yazziet', name: 'Meribet', fieldValue: 'Meribet Sampson' },
+  { slug: 'mclaudia', name: 'Maria Claudia', fieldValue: 'Maria Claudia' },
+  { slug: 'evargas22', name: 'Erika', fieldValue: 'Erika Vargas' },
+]
+
+const CUSTOMER_SERVICE_TEAM = [
+  { slug: 'aline-strelow', name: 'Aline', fieldValue: 'Aline Strelow' },
+  { slug: 'brayam-zuluaga', name: 'Brayam', fieldValue: 'Brayam Zuluaga' },
+  { slug: 'arles-martinez', name: 'Arles', fieldValue: 'Arles Martinez' },
+  { slug: 'edmilson-morales', name: 'Edmilson', fieldValue: 'Edmilson Morales' },
+]
+
+const FRONT_DESK_TEAM = [
+  { slug: 'laura-sanchez', name: 'Laura', fieldValue: 'Laura Sanchez' },
+  { slug: 'william-carcamo', name: 'William', fieldValue: 'William Carcamo' },
+  { slug: 'ailene-nuevas', name: 'Ailene', fieldValue: 'Ailene Nuevas' },
+]
+
+export async function getPrioritySellerAvailability({
+  limit = 6,
+  preferredTime = '',
+  preferredSpecialist = '',
+  timezone = EASTERN_TIMEZONE,
+  language = '',
+} = {}) {
+  return getTeamAvailability({
+    members: filterSellersByPreference(getConfiguredPrioritySellers(), preferredSpecialist),
+    limit,
+    preferredTime,
+    timezone,
+    language,
+  })
+}
+
+export async function getCustomerServiceAvailability({
+  limit = 6,
+  preferredTime = '',
+  preferredSpecialist = '',
+  timezone = EASTERN_TIMEZONE,
+  language = '',
+} = {}) {
+  return getTeamAvailability({
+    members: filterSellersByPreference(getConfiguredCustomerServiceTeam(), preferredSpecialist),
+    limit,
+    preferredTime,
+    timezone,
+    language,
+  })
+}
+
+export async function getNewClientAvailability({
+  limit = 6,
+  preferredTime = '',
+  preferredSpecialist = '',
+  timezone = EASTERN_TIMEZONE,
+  language = '',
+} = {}) {
+  return getTeamAvailability({
+    members: filterSellersByPreference(getConfiguredNewClientBookingTeam(), preferredSpecialist),
+    limit,
+    preferredTime,
+    timezone,
+    language,
+  })
+}
+
+async function getTeamAvailability({
+  members,
+  limit = 6,
+  preferredTime = '',
+  timezone = EASTERN_TIMEZONE,
+  language = '',
+}) {
+  const options = []
+  const preference = parsePreferredTime(preferredTime, timezone)
+  const weekdays = parsePreferredWeekdays(preferredTime)
+  const weekday = weekdays[0] ?? null
+  const monthOffsets = getAvailabilityMonthOffsets(preference, weekday, timezone)
+
+  for (const [sellerIndex, seller] of members.entries()) {
+    const meetingInfo = await fetchMeetingInfo({ slug: seller.slug, timezone }).catch((error) => {
+      console.warn(`Unable to fetch HubSpot meeting info for ${seller.name}: ${error.message}`)
+      return null
+    })
+
+    if (!meetingInfo) {
+      continue
+    }
+
+    const supportedFormFieldNames = getSupportedFormFieldNames(meetingInfo)
+    const duration = meetingInfo.customParams?.durations?.[0] || 1200000
+
+    if (duration !== 1200000 && duration !== 1800000) {
+      continue
+    }
+
+    let availabilityPages = await Promise.all(
+      monthOffsets.map((monthOffset) =>
+        fetchAvailability({ slug: seller.slug, timezone, monthOffset }).catch((error) => {
+          console.warn(`Unable to fetch HubSpot availability for ${seller.name}: ${error.message}`)
+          return null
+        }),
+      ),
+    )
+    let slots = availabilityPages.flatMap(
+      (availability) =>
+        availability?.linkAvailability?.linkAvailabilityByDuration?.[duration]?.availabilities || [],
+    )
+
+    const filterCandidateSlots = (candidatePool) => candidatePool
+      .filter((slot) => slot.startMillisUtc >= Date.now() + MIN_BOOKING_LEAD_TIME_MS)
+      .filter((slot) => {
+      const slotDateKey = getDateKey(slot.startMillisUtc, timezone)
+
+      if (preference.dateKey && slotDateKey !== preference.dateKey) {
+        return false
+      }
+
+      if (preference.minimumDateKey && slotDateKey < preference.minimumDateKey) {
+        return false
+      }
+
+      if (preference.maximumDateKey && slotDateKey > preference.maximumDateKey) {
+        return false
+      }
+
+      if (weekdays.length === 0) {
+        return true
+      }
+      const slotDate = new Date(slot.startMillisUtc)
+      const slotWeekdayStr = new Intl.DateTimeFormat('en-US', {
+        weekday: 'long',
+        timeZone: timezone,
+      }).format(slotDate).toLowerCase()
+
+      const weekdaysEnglish = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+      return weekdays.includes(weekdaysEnglish.indexOf(slotWeekdayStr))
+    })
+    let candidateSlots = filterCandidateSlots(slots)
+
+    // A general next-available search can land on the final evening of a month,
+    // when HubSpot's current-month page contains no remaining future slots.
+    // Search one additional month before reporting that the calendar is empty.
+    if (!preference.dateKey && candidateSlots.length === 0) {
+      const nextMonthOffset = Math.max(...monthOffsets) + 1
+      const nextAvailability = await fetchAvailability({
+        slug: seller.slug,
+        timezone,
+        monthOffset: nextMonthOffset,
+      }).catch((error) => {
+        console.warn(`Unable to fetch extended HubSpot availability for ${seller.name}: ${error.message}`)
+        return null
+      })
+
+      availabilityPages = [...availabilityPages, nextAvailability]
+      slots = availabilityPages.flatMap(
+        (availability) =>
+          availability?.linkAvailability?.linkAvailabilityByDuration?.[duration]?.availabilities || [],
+      )
+      candidateSlots = filterCandidateSlots(slots)
+    }
+    const maxSlotsPerSeller = preference.dateKey || preference.hour != null || weekdays.length > 0 ? 100 : 6
+
+    for (const slot of candidateSlots.slice(0, maxSlotsPerSeller)) {
+      options.push({
+        sellerName: seller.name,
+        sellerSlug: seller.slug,
+        sellerFieldValue: seller.fieldValue,
+        supportedFormFieldNames,
+        startTime: slot.startMillisUtc,
+        endTime: slot.endMillisUtc,
+        duration,
+        timezone,
+        sellerPriority: sellerIndex,
+        bookingTeam: seller.bookingTeam || 'sales',
+        display: formatSpecialistSlot({
+          specialistName: seller.name,
+          timestamp: slot.startMillisUtc,
+          timezone,
+          language,
+        }),
+      })
+    }
+  }
+
+  const sortedOptions = options.sort((left, right) =>
+    compareAvailabilityOptions(left, right, preference, timezone),
+  )
+
+  return sortedOptions
+    .slice(0, limit)
+    .map((option, index) => ({
+      ...option,
+      id: String(index + 1),
+    }))
+}
+
+export function compareAvailabilityOptions(left, right, preference, timezone) {
+  if (preference.dateKey) {
+    const leftDateScore = getDateDistance(left.startTime, preference.dateKey, timezone)
+    const rightDateScore = getDateDistance(right.startTime, preference.dateKey, timezone)
+
+    if (leftDateScore !== rightDateScore) {
+      return leftDateScore - rightDateScore
+    }
+  }
+
+  if (preference.hour != null) {
+    const leftScore = getTimeDistance(left.startTime, preference, timezone)
+    const rightScore = getTimeDistance(right.startTime, preference, timezone)
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore
+    }
+  }
+
+  if (left.startTime !== right.startTime) {
+    return left.startTime - right.startTime
+  }
+
+  return left.sellerPriority - right.sellerPriority
+}
+
+function getMonthOffsetForPreference(preference, timezone) {
+  const targetDateKey = preference.dateKey || preference.monthStartKey || preference.minimumDateKey
+
+  if (!targetDateKey) {
+    return 0
+  }
+
+  const current = getDateParts(Date.now(), timezone)
+  const [targetYear, targetMonth] = targetDateKey.split('-').map(Number)
+
+  if (!targetYear || !targetMonth) {
+    return 0
+  }
+
+  return Math.max(0, (targetYear - current.year) * 12 + (targetMonth - current.month))
+}
+
+export function getAvailabilityMonthOffsets(preference, weekday, timezone) {
+  const monthOffset = getMonthOffsetForPreference(preference, timezone)
+
+  // HubSpot availability pages are month-scoped. A weekday request such as
+  // "next Saturday" can cross the month boundary.
+  if (preference.dateKey) {
+    return [monthOffset]
+  }
+
+  if (preference.monthStartKey) {
+    return [monthOffset]
+  }
+
+  if (preference.minimumDateKey) {
+    return [monthOffset, monthOffset + 1]
+  }
+
+  // General availability also needs the following page. Around midnight and
+  // month-end, the customer's local date can already be in the next month while
+  // HubSpot's scheduling timezone is still on the previous calendar month.
+  return [monthOffset, monthOffset + 1]
+}
+
+export function parsePreferredTime(value, timezone) {
+  const normalized = String(value || '').toLowerCase()
+  const monthRange = parsePreferredMonthRange(normalized, timezone)
+  const minimumDateKey = parsePreferredMinimumDateKey(normalized, timezone)
+  const preference = {
+    dateKey: parsePreferredDateKey(normalized, timezone),
+    ...(monthRange || {}),
+    ...(minimumDateKey ? { minimumDateKey } : {}),
+  }
+  const timeText = normalized
+    .replace(
+      /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?\b/i,
+      '',
+    )
+    .replace(/\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b/, '')
+    .replace(/\b\d{1,2}(?:st|nd|rd|th)\b/i, '')
+  const hourMatch = timeText.match(/\b(1[0-2]|0?[1-9])(?:[:.]\d{2})?\s*(am|pm)?\b/)
+
+  if (!hourMatch) {
+    return preference
+  }
+
+  let hour = Number(hourMatch[1])
+  const period = hourMatch[2]
+  const minuteMatch = hourMatch[0].match(/[:.](\d{2})/)
+  const minute = minuteMatch ? Number(minuteMatch[1]) : 0
+
+  if (period === 'pm' && hour < 12) {
+    hour += 12
+  }
+
+  if (period === 'am' && hour === 12) {
+    hour = 0
+  }
+
+  return { ...preference, hour, minute }
+}
+
+function parsePreferredMonthRange(value, timezone) {
+  const requestedMonth = extractAvailabilityMonth(value)
+  if (!requestedMonth) return null
+
+  const current = getDateParts(Date.now(), timezone)
+  let year = current.year
+  if (requestedMonth.month < current.month) year += 1
+
+  const lastDay = new Date(Date.UTC(year, requestedMonth.month, 0)).getUTCDate()
+  const month = pad2(requestedMonth.month)
+
+  return {
+    monthStartKey: `${year}-${month}-01`,
+    minimumDateKey: `${year}-${month}-01`,
+    maximumDateKey: `${year}-${month}-${pad2(lastDay)}`,
+  }
+}
+
+function parsePreferredMinimumDateKey(value, timezone) {
+  const normalized = normalizeTreatmentSearchText(value)
+
+  if (!/\b(next week|following week|proxima semana|semana que viene|semana siguiente|semana seguinte)\b/.test(normalized)) {
+    return ''
+  }
+
+  const currentWeekday = getWeekdayIndex(Date.now(), timezone)
+  const daysUntilNextMonday = currentWeekday === 0 ? 1 : 8 - currentWeekday
+  return getDateKey(Date.now() + daysUntilNextMonday * 24 * 60 * 60 * 1000, timezone)
+}
+
+function getWeekdayIndex(timestamp, timezone) {
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    timeZone: timezone,
+  }).format(new Date(timestamp)).toLowerCase()
+
+  return ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(weekday)
+}
+
+function parsePreferredDateKey(value, timezone) {
+  const localizedMonthDay = extractAvailabilityMonthDay(value)
+
+  if (localizedMonthDay) {
+    return buildDateKeyFromMonthDay(localizedMonthDay.name, localizedMonthDay.day, timezone)
+  }
+
+  const relativeDateKey = parseRelativePreferredDateKey(value, timezone)
+
+  if (relativeDateKey) {
+    return relativeDateKey
+  }
+
+  const monthMatch = value.match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i,
+  )
+
+  if (monthMatch) {
+    return buildDateKeyFromMonthDay(monthMatch[1], Number(monthMatch[2]), timezone)
+  }
+
+  const numericDateMatch = value.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?\b/)
+
+  if (numericDateMatch) {
+    return buildDateKey(Number(numericDateMatch[1]), Number(numericDateMatch[2]), timezone)
+  }
+
+  const ordinalDayMatch = value.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/)
+
+  if (ordinalDayMatch) {
+    return buildDateKeyForDayOfMonth(Number(ordinalDayMatch[1]), timezone)
+  }
+
+  return ''
+}
+
+function parseRelativePreferredDateKey(value, timezone) {
+  const normalized = normalizeTreatmentSearchText(value)
+  const usesMananaAsMorning = /\b(?:en|por) la manana\b|\bmanana (?:es|me)\b/.test(normalized)
+
+  if (/\b(today|hoy|hoje)\b/.test(normalized)) {
+    return getDateKey(Date.now(), timezone)
+  }
+
+  if (/\b(day after tomorrow|pasado manana|pasado maÃ±ana|depois de amanha|depois de amanh[aÃ£])\b/.test(normalized)) {
+    return buildRelativeDateKey(2, timezone)
+  }
+
+  if (
+    /\b(tomorrow|next day|the next day|next available day|dia siguiente|proximo dia|pr[oÃ³]ximo dia|amanha|amanh[aÃ£])\b/.test(normalized) ||
+    (!usesMananaAsMorning && /\b(manana|maÃ±ana)\b/.test(normalized))
+  ) {
+    return buildRelativeDateKey(1, timezone)
+  }
+
+  return ''
+}
+
+function buildRelativeDateKey(dayOffset, timezone) {
+  const target = new Date(Date.now() + dayOffset * 24 * 60 * 60 * 1000)
+  const parts = getDateParts(target.getTime(), timezone)
+
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`
+}
+
+function buildDateKeyFromMonthDay(monthName, day, timezone) {
+  const monthIndex = [
+    'jan',
+    'feb',
+    'mar',
+    'apr',
+    'may',
+    'jun',
+    'jul',
+    'aug',
+    'sep',
+    'oct',
+    'nov',
+    'dec',
+  ].findIndex((month) => monthName.toLowerCase().startsWith(month))
+
+  if (monthIndex === -1) {
+    return ''
+  }
+
+  const current = getDateParts(Date.now(), timezone)
+  const currentKey = `${current.year}-${pad2(current.month)}-${pad2(current.day)}`
+  let dateKey = buildDateKey(monthIndex + 1, day, timezone, current.year)
+
+  if (dateKey && dateKey < currentKey) {
+    dateKey = buildDateKey(monthIndex + 1, day, timezone, current.year + 1)
+  }
+
+  return dateKey
+}
+
+function buildDateKeyForDayOfMonth(day, timezone) {
+  const current = getDateParts(Date.now(), timezone)
+  let month = current.month
+  let year = current.year
+
+  if (day < current.day) {
+    month += 1
+
+    if (month > 12) {
+      month = 1
+      year += 1
+    }
+  }
+
+  return buildDateKey(month, day, timezone, year)
+}
+
+function buildDateKey(month, day, timezone, year = getDateParts(Date.now(), timezone).year) {
+  if (!month || !day || month < 1 || month > 12 || day < 1 || day > 31) {
+    return ''
+  }
+
+  return `${year}-${pad2(month)}-${pad2(day)}`
+}
+
+function getDateKey(timestamp, timezone) {
+  const parts = getDateParts(timestamp, timezone)
+
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`
+}
+
+function getDateDistance(timestamp, targetDateKey, timezone) {
+  return Math.abs(dateKeyToNumber(getDateKey(timestamp, timezone)) - dateKeyToNumber(targetDateKey))
+}
+
+function dateKeyToNumber(dateKey) {
+  return Number(String(dateKey).replace(/\D/g, '')) || 0
+}
+
+function getDateParts(timestamp, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: timezone,
+  }).formatToParts(new Date(timestamp))
+
+  return {
+    year: Number(parts.find((part) => part.type === 'year')?.value || 0),
+    month: Number(parts.find((part) => part.type === 'month')?.value || 0),
+    day: Number(parts.find((part) => part.type === 'day')?.value || 0),
+  }
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+function getTimeDistance(timestamp, preference, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: timezone,
+  }).formatToParts(new Date(timestamp))
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value || 0)
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value || 0)
+  const preferredMinute = preference.minute || 0
+
+  return Math.abs(hour * 60 + minute - (preference.hour * 60 + preferredMinute))
+}
+
+export async function bookPrioritySellerMeeting({ customer, option }) {
+  return bookTeamMeeting({
+    customer,
+    option,
+    members: getConfiguredPrioritySellers(),
+    teamLabel: 'priority seller',
+  })
+}
+
+export async function bookCustomerServiceMeeting({ customer, option }) {
+  return bookTeamMeeting({
+    customer,
+    option,
+    members: getConfiguredCustomerServiceTeam(),
+    teamLabel: 'customer service team',
+  })
+}
+
+export async function checkBookingCalendarHealth({ timezone = EASTERN_TIMEZONE } = {}) {
+  const results = []
+  for (const member of getConfiguredNewClientBookingTeam()) {
+    try {
+      const meetingInfo = await fetchMeetingInfo({ slug: member.slug, timezone })
+      const duration = Number(meetingInfo.customParams?.durations?.[0] || 0)
+      if (duration !== 1200000 && duration !== 1800000) {
+        results.push({ sellerSlug: member.slug, status: 'unsupported_duration', duration })
+        continue
+      }
+      const pages = await Promise.all([
+        fetchAvailability({ slug: member.slug, timezone, monthOffset: 0 }),
+        fetchAvailability({ slug: member.slug, timezone, monthOffset: 1 }),
+      ])
+      const slots = pages.flatMap((page) =>
+        page?.linkAvailability?.linkAvailabilityByDuration?.[duration]?.availabilities || [],
+      )
+      results.push({
+        sellerSlug: member.slug,
+        status: slots.length ? 'healthy' : 'no_availability',
+        availableSlotCount: slots.length,
+      })
+    } catch (error) {
+      results.push({
+        sellerSlug: member.slug,
+        status: /calendar|offline|connect/i.test(error.message) ? 'calendar_disconnected' : 'meeting_page_error',
+        error: String(error.message || error).slice(0, 300),
+      })
+    }
+  }
+  return results
+}
+
+export async function reconcilePrioritySellerMeeting({ customer, option }) {
+  return reconcileTeamMeeting({ customer, option, members: getConfiguredPrioritySellers(), teamLabel: 'priority seller' })
+}
+
+export async function reconcileCustomerServiceMeeting({ customer, option }) {
+  return reconcileTeamMeeting({ customer, option, members: getConfiguredCustomerServiceTeam(), teamLabel: 'customer service team' })
+}
+
+export async function isMeetingOptionAvailable(option = {}) {
+  const sellerSlug = String(option.sellerSlug || '').trim()
+  const startTime = Number(option.startTime)
+  const timezone = option.timezone || EASTERN_TIMEZONE
+  if (!sellerSlug || !Number.isFinite(startTime)) return false
+
+  const meetingInfo = await fetchMeetingInfo({ slug: sellerSlug, timezone })
+  const duration = Number(option.duration || meetingInfo.customParams?.durations?.[0] || 1200000)
+  const target = getDateParts(startTime, timezone)
+  const current = getDateParts(Date.now(), timezone)
+  const monthOffset = Math.max(0, (target.year - current.year) * 12 + (target.month - current.month))
+  const availability = await fetchAvailability({ slug: sellerSlug, timezone, monthOffset })
+  const slots = availability?.linkAvailability?.linkAvailabilityByDuration?.[duration]?.availabilities || []
+
+  return slots.some((slot) => Number(slot.startMillisUtc) === startTime)
+}
+
+export async function enrollContactInPostBookingWorkflow(email) {
+  if (!email) {
+    throw new Error('A HubSpot contact email is required for workflow enrollment.')
+  }
+
+  const workflowId = process.env.HUBSPOT_POST_BOOKING_WORKFLOW_ID || DEFAULT_POST_BOOKING_WORKFLOW_ID
+  const workflow = await hubspotGet(`/automation/v4/flows/${encodeURIComponent(workflowId)}`)
+  if (!workflow?.isEnabled) {
+    throw new Error(`HubSpot post-booking workflow ${workflowId} is not enabled.`)
+  }
+
+  // Modern event-based HubSpot flows enroll from their configured event.
+  // The scheduler booking is that event; legacy v2 manual enrollment rejects
+  // v4 flow IDs with "resource not found" and must not be retried.
+  return {
+    ok: true,
+    workflowId,
+    email,
+    automaticEnrollment: true,
+    workflowName: workflow.name || '',
+  }
+}
+
+async function bookTeamMeeting({ customer, option, members, teamLabel }) {
+  const timezone = EASTERN_TIMEZONE
+  const token = requireHubSpotToken()
+  const seller = members.find((item) => item.slug === option?.sellerSlug)
+
+  if (!seller) {
+    throw new Error(`Selected specialist is not in the ${teamLabel} list.`)
+  }
+
+  const supportedFormFieldNames = option.supportedFormFieldNames?.length
+    ? option.supportedFormFieldNames
+    : getSupportedFormFieldNames(await fetchMeetingInfo({ slug: seller.slug, timezone }))
+
+  let contact = await upsertBookingContactProperties(customer)
+
+  const payload = {
+    slug: seller.slug,
+    firstName: customer.firstName,
+    lastName: customer.lastName,
+    email: customer.email,
+    startTime: option.startTime,
+    duration: option.duration,
+    timezone,
+    locale: resolveLocale(customer.preferredLanguage),
+    guestEmails: [],
+    likelyAvailableUserIds: [],
+    formFields: buildBookingFormFields({
+      customer,
+      seller,
+      supportedFormFieldNames,
+    }),
+  }
+
+  const bookingRequestedAt = Date.now()
+  const response = await fetch(
+    `${HUBSPOT_API_BASE_URL}/scheduler/v3/meetings/meeting-links/book?timezone=${encodeURIComponent(timezone)}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
+  )
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    console.warn('[hubspot-booking-failed]', {
+      status: response.status,
+      seller: seller.slug,
+      startTime: option.startTime,
+      duration: option.duration,
+      message: data.message,
+      errors: data.errors,
+      category: data.category,
+    })
+    const error = new Error(data.message || `HubSpot booking failed with ${response.status}.`)
+    error.status = response.status
+    error.category = data.category || ''
+    throw error
+  }
+
+  if (data.isOffline) {
+    throw new Error(
+      'HubSpot accepted this as an offline booking request, but no calendar event was created. Please check that this specialist has a connected calendar in HubSpot.',
+    )
+  }
+
+  let confirmedMeeting = null
+
+  if (!data.calendarEventId) {
+    // HubSpot can create the CRM meeting before the scheduler response exposes
+    // its calendar event ID. Reconcile the exact contact and requested start
+    // before treating the booking as failed or attempting a replacement slot.
+    confirmedMeeting = await findBookedMeetingForContactWithRetry({
+      contactId: contact?.id,
+      startTime: option.startTime,
+    })
+
+    if (!confirmedMeeting?.id) {
+      throw new Error('HubSpot did not return a calendar event ID, so the appointment was not confirmed.')
+    }
+  }
+
+  contact = await upsertBookingContactProperties(customer).catch((error) => {
+    console.warn(`Unable to update booked contact details: ${error.message}`)
+    return contact
+  })
+
+  confirmedMeeting = confirmedMeeting || await findRecentlyCreatedScheduledMeetingWithRetry({
+    contactId: contact?.id,
+    createdAfter: bookingRequestedAt - 10_000,
+  })
+  confirmedMeeting = confirmedMeeting || await findBookedMeetingForContactWithRetry({
+    contactId: contact?.id,
+    startTime: option.startTime,
+  })
+  const confirmedStartTime = new Date(
+    confirmedMeeting?.properties?.hs_meeting_start_time || 0,
+  ).getTime()
+
+  if (!confirmedMeeting?.id || !confirmedStartTime) {
+    throw new Error('HubSpot created a calendar event, but its confirmed meeting timestamp could not be verified.')
+  }
+
+  assertConfirmedMeetingMatchesOption(option.startTime, confirmedStartTime)
+
+  const dealSync = await syncBookedMeetingDeal({
+    customer,
+    option,
+    seller,
+    contact,
+    meeting: confirmedMeeting,
+  }).catch((error) => {
+    console.warn(`Unable to sync booked meeting deal: ${error.message}`)
+    return {
+      ok: false,
+      error: error.message,
+    }
+  })
+  const appointmentContactSync = await syncBookedTimeToContact({
+    contact,
+    customer,
+    startTime: dealSync.meetingStartTime || option.startTime,
+  }).catch((error) => {
+    console.warn(`Unable to sync booked time before HubSpot workflow enrollment: ${error.message}`)
+    return { ok: false, error: error.message }
+  })
+  const workflowEnrollment = appointmentContactSync.ok
+    ? await enrollContactInPostBookingWorkflow(customer.email).catch((error) => {
+        console.warn(`Unable to enroll booked contact in HubSpot confirmation workflow: ${error.message}`)
+        return { ok: false, error: error.message }
+      })
+    : {
+        ok: false,
+        skipped: true,
+        error: 'Workflow enrollment skipped because the confirmed appointment time was not synced to the contact.',
+      }
+
+  return {
+    ...data,
+    confirmedStartTime,
+    dealSync,
+    appointmentContactSync,
+    workflowEnrollment,
+    sellerName: seller.name,
+    sellerFieldValue: seller.fieldValue,
+    sellerSlug: seller.slug,
+    display: formatSpecialistSlot({
+      specialistName: seller.name,
+      timestamp: option.startTime,
+      timezone,
+      language: customer.preferredLanguage,
+    }),
+  }
+}
+
+async function reconcileTeamMeeting({ customer, option, members, teamLabel }) {
+  const seller = members.find((item) => item.slug === option?.sellerSlug)
+  if (!seller) throw new Error(`Selected specialist is not in the ${teamLabel} list.`)
+
+  const contact = await findHubSpotContactByEmail(customer.email)
+  if (!contact?.id) return null
+  const meeting = await findBookedMeetingForContact({ contactId: contact.id, startTime: option.startTime })
+  if (!meeting?.id) return null
+
+  const confirmedStartTime = new Date(meeting.properties?.hs_meeting_start_time || 0).getTime()
+  assertConfirmedMeetingMatchesOption(option.startTime, confirmedStartTime)
+  const dealSync = await syncBookedMeetingDeal({ customer, option, seller, contact, meeting })
+    .catch((error) => ({ ok: false, error: error.message }))
+  const appointmentContactSync = await syncBookedTimeToContact({ contact, customer, startTime: confirmedStartTime })
+    .catch((error) => ({ ok: false, error: error.message }))
+  const workflowEnrollment = appointmentContactSync.ok
+    ? await enrollContactInPostBookingWorkflow(customer.email).catch((error) => ({ ok: false, error: error.message }))
+    : { ok: false, skipped: true, error: 'Workflow enrollment skipped because the confirmed appointment time was not synced to the contact.' }
+
+  return {
+    calendarEventId: meeting.id,
+    confirmedStartTime,
+    dealSync,
+    appointmentContactSync,
+    workflowEnrollment,
+    sellerName: seller.name,
+    sellerFieldValue: seller.fieldValue,
+    sellerSlug: seller.slug,
+    reconciled: true,
+    display: formatSpecialistSlot({
+      specialistName: seller.name,
+      timestamp: confirmedStartTime,
+      timezone: EASTERN_TIMEZONE,
+      language: customer.preferredLanguage,
+    }),
+  }
+}
+
+export function assertConfirmedMeetingMatchesOption(expectedStartTime, confirmedStartTime) {
+  const expected = Number(expectedStartTime)
+  const confirmed = Number(confirmedStartTime)
+
+  if (!Number.isFinite(expected) || !Number.isFinite(confirmed) ||
+      Math.abs(confirmed - expected) > BOOKED_MEETING_START_TOLERANCE_MS) {
+    const error = new Error(
+      `HubSpot confirmed a different appointment time. Expected ${new Date(expected).toISOString()}, received ${new Date(confirmed).toISOString()}.`,
+    )
+    error.category = 'confirmed_time_mismatch'
+    error.expectedStartTime = expected
+    error.confirmedStartTime = confirmed
+    throw error
+  }
+
+  return confirmed
+}
+
+async function syncBookedTimeToContact({ contact, customer, startTime }) {
+  const contactRecord = contact?.id ? contact : await findHubSpotContactByEmail(customer.email)
+
+  if (!contactRecord?.id) {
+    throw new Error('HubSpot contact was not found before confirmation workflow enrollment.')
+  }
+
+  const propertyName =
+    process.env.HUBSPOT_CONTACT_BOOKED_TIME_PROPERTY || DEFAULT_CONTACT_BOOKED_TIME_PROPERTY
+  const displayTime = formatHubSpotWorkflowAppointmentTime(startTime)
+
+  await updateContactProperties(contactRecord.id, {
+    [propertyName]: displayTime,
+  })
+
+  return {
+    ok: true,
+    contactId: contactRecord.id,
+    propertyName,
+    displayTime,
+  }
+}
+
+export function formatHubSpotWorkflowAppointmentTime(timestamp) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: EASTERN_TIMEZONE,
+  }).formatToParts(Number(timestamp))
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+
+  return `${values.month} ${values.day}, ${values.year} ${values.hour}:${values.minute} ${values.dayPeriod}`
+}
+
+export function buildBookingFormFields({ customer, seller, supportedFormFieldNames = [] }) {
+  const supportedNames = new Set(supportedFormFieldNames)
+
+  return [
+    { name: 'create_deal', value: 'true' },
+    { name: 'agent_lead_management', value: seller.fieldValue },
+    { name: 'dont_send_notification', value: 'false' },
+    { name: 'desired_treatment', value: customer.desiredTreatment },
+    { name: 'desired_treatment_form', value: customer.desiredTreatment },
+  ].filter((field) => field.value && supportedNames.has(field.name))
+}
+
+async function syncBookedMeetingDeal({ customer, option, seller, contact, meeting: confirmedMeeting }) {
+  const contactRecord = contact?.id ? contact : await findHubSpotContactByEmail(customer.email)
+
+  if (!contactRecord?.id) {
+    throw new Error('HubSpot contact was not found after booking.')
+  }
+
+  const meeting = confirmedMeeting || await findBookedMeetingForContactWithRetry({
+    contactId: contactRecord.id,
+    startTime: option.startTime,
+  })
+  const confirmedMeetingStartTime = new Date(
+    meeting?.properties?.hs_meeting_start_time || 0,
+  ).getTime()
+
+  if (!meeting?.id || !confirmedMeetingStartTime) {
+    throw new Error(
+      'The confirmed HubSpot meeting could not be found, so deal synchronization was skipped to avoid mismatched meeting dates.',
+    )
+  }
+
+  const properties = buildBookingDealProperties({
+    customer,
+    seller,
+    option,
+    meeting,
+  })
+  const existingDeal = await findNativeBookingDealWithRetry({
+    contactId: contactRecord.id,
+    meeting,
+  })
+  const deal = existingDeal
+    ? await updateDealProperties(existingDeal.id, properties)
+    : await createDealProperties(properties)
+
+  await associateHubSpotObjects('deals', deal.id, 'contacts', contactRecord.id)
+
+  await associateHubSpotObjects('deals', deal.id, 'meetings', meeting.id)
+
+  return {
+    ok: true,
+    dealId: deal.id,
+    meetingId: meeting.id,
+    meetingStartTime: confirmedMeetingStartTime,
+    reused: Boolean(existingDeal),
+  }
+}
+
+async function findNativeBookingDealWithRetry({ contactId, meeting }) {
+  const maxAttempts = Number(process.env.HUBSPOT_BOOKED_DEAL_LOOKUP_ATTEMPTS || 10)
+  const delayMs = Number(process.env.HUBSPOT_BOOKED_DEAL_LOOKUP_DELAY_MS || 1000)
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const deal = await findNativeBookingDeal({ contactId, meeting })
+    if (deal?.id) return deal
+    if (attempt < maxAttempts) await sleep(delayMs)
+  }
+
+  return null
+}
+
+async function findNativeBookingDeal({ contactId, meeting }) {
+  const meetingDealIds = await getAssociatedObjectIds('meetings', meeting.id, 'deals')
+  if (meetingDealIds.length) {
+    return fetchHubSpotObject('deals', meetingDealIds[0], [getDealEvaluationDateProperty()])
+  }
+
+  const contactDealIds = await getAssociatedObjectIds('contacts', contactId, 'deals')
+  if (!contactDealIds.length) return null
+
+  const confirmedStart = new Date(meeting.properties?.hs_meeting_start_time || 0).getTime()
+  const deals = await Promise.all(
+    contactDealIds.map((dealId) =>
+      fetchHubSpotObject('deals', dealId, [getDealEvaluationDateProperty()]).catch(() => null),
+    ),
+  )
+
+  return deals.find((deal) => {
+    const evaluationTime = Number(deal?.properties?.[getDealEvaluationDateProperty()] || 0)
+    return evaluationTime && Math.abs(evaluationTime - confirmedStart) <= BOOKED_MEETING_START_TOLERANCE_MS
+  }) || null
+}
+
+async function findBookedMeetingForContactWithRetry({ contactId, startTime }) {
+  const maxAttempts = Number(process.env.HUBSPOT_BOOKED_MEETING_LOOKUP_ATTEMPTS || BOOKED_MEETING_LOOKUP_ATTEMPTS)
+  const delayMs = Number(process.env.HUBSPOT_BOOKED_MEETING_LOOKUP_DELAY_MS || BOOKED_MEETING_LOOKUP_DELAY_MS)
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const meeting = await findBookedMeetingForContact({ contactId, startTime })
+
+    if (meeting?.id && meeting?.properties?.hubspot_owner_id) {
+      return meeting
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(delayMs)
+    }
+  }
+
+  return findBookedMeetingForContact({ contactId, startTime })
+}
+
+async function findRecentlyCreatedScheduledMeetingWithRetry({ contactId, createdAfter }) {
+  if (!contactId) return null
+
+  const maxAttempts = Number(process.env.HUBSPOT_BOOKED_MEETING_LOOKUP_ATTEMPTS || BOOKED_MEETING_LOOKUP_ATTEMPTS)
+  const delayMs = Number(process.env.HUBSPOT_BOOKED_MEETING_LOOKUP_DELAY_MS || BOOKED_MEETING_LOOKUP_DELAY_MS)
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const meeting = await findRecentlyCreatedScheduledMeeting({ contactId, createdAfter })
+    if (meeting?.id) return meeting
+    if (attempt < maxAttempts) await sleep(delayMs)
+  }
+
+  return null
+}
+
+export function buildBookingDealProperties({ customer, seller, option, meeting }) {
+  const fullName = formatCustomerName(customer)
+  const treatment = normalizeDesiredTreatment(customer.desiredTreatment)
+  const confirmedMeetingStartTime = new Date(
+    meeting?.properties?.hs_meeting_start_time || 0,
+  ).getTime()
+  const properties = {
+    dealname: `${getDealNamePrefix()} - ${fullName}`,
+    pipeline: getDealPipeline(),
+    dealstage: getDealStage(),
+    [getDealEvaluationDateProperty()]: String(confirmedMeetingStartTime || option.startTime),
+    [getDealCreatedByAiProperty()]: 'true',
+    agent_lead_management: seller.fieldValue,
+    desired_treatment: treatment,
+    phone: formatUsPhoneForHubSpot(customer.phone),
+  }
+
+  if (meeting?.properties?.hubspot_owner_id) {
+    properties.hubspot_owner_id = meeting.properties.hubspot_owner_id
+  } else {
+    console.warn('[hubspot-deal-owner-missing]', {
+      seller: seller.slug,
+      sellerFieldValue: seller.fieldValue,
+      startTime: option.startTime,
+      meetingId: meeting?.id || null,
+    })
+  }
+
+  return Object.fromEntries(
+    Object.entries(properties).filter(([, value]) => Boolean(value)),
+  )
+}
+
+function formatCustomerName(customer) {
+  const fullName = [customer.firstName, customer.lastName].filter(Boolean).join(' ').trim()
+
+  return fullName || customer.email || customer.phone || 'New Lead'
+}
+
+function getDealPipeline() {
+  return process.env.HUBSPOT_DEAL_PIPELINE || DEFAULT_DEAL_PIPELINE
+}
+
+function getDealStage() {
+  return process.env.HUBSPOT_DEAL_STAGE || DEFAULT_DEAL_STAGE
+}
+
+function getDealEvaluationDateProperty() {
+  return process.env.HUBSPOT_DEAL_EVALUATION_DATE_PROPERTY || DEFAULT_DEAL_EVALUATION_DATE_PROPERTY
+}
+
+function getDealCreatedByAiProperty() {
+  return process.env.HUBSPOT_DEAL_CREATED_BY_AI_PROPERTY || DEFAULT_DEAL_CREATED_BY_AI_PROPERTY
+}
+
+function getDealNamePrefix() {
+  return process.env.HUBSPOT_DEAL_NAME_PREFIX || DEFAULT_DEAL_NAME_PREFIX
+}
+
+async function findBookedMeetingForContact({ contactId, startTime }) {
+  const associations = await getAssociatedObjectIds('contacts', contactId, 'meetings')
+
+  if (!associations.length) {
+    return null
+  }
+
+  const meetings = await Promise.all(
+    associations.map((meetingId) =>
+      fetchHubSpotObject('meetings', meetingId, [
+        'hs_meeting_start_time',
+        'hs_meeting_title',
+        'hs_meeting_outcome',
+        'hubspot_owner_id',
+      ]).catch(() => null),
+    ),
+  )
+  const targetStart = Number(startTime)
+
+  const closestMeeting = meetings
+    .filter(Boolean)
+    .map((meeting) => ({
+      ...meeting,
+      startDelta: Math.abs(
+        new Date(meeting.properties?.hs_meeting_start_time || 0).getTime() - targetStart,
+      ),
+    }))
+    .sort((left, right) => left.startDelta - right.startDelta)[0]
+
+  return closestMeeting?.startDelta <= BOOKED_MEETING_START_TOLERANCE_MS ? closestMeeting : null
+}
+
+async function findRecentlyCreatedScheduledMeeting({ contactId, createdAfter }) {
+  const associations = await getAssociatedObjectIds('contacts', contactId, 'meetings')
+  const meetings = await Promise.all(
+    associations.map((meetingId) =>
+      fetchHubSpotObject('meetings', meetingId, [
+        'hs_createdate',
+        'hs_meeting_start_time',
+        'hs_meeting_end_time',
+        'hs_meeting_outcome',
+        'hubspot_owner_id',
+      ]).catch(() => null),
+    ),
+  )
+
+  return meetings
+    .filter((meeting) => meeting?.id)
+    .filter((meeting) => String(meeting.properties?.hs_meeting_outcome || '').toUpperCase() !== 'CANCELED')
+    .filter((meeting) => new Date(meeting.properties?.hs_createdate || 0).getTime() >= Number(createdAfter || 0))
+    .sort((left, right) =>
+      new Date(right.properties?.hs_createdate || 0).getTime() -
+      new Date(left.properties?.hs_createdate || 0).getTime(),
+    )[0] || null
+}
+
+function sleep(ms) {
+  return new Promise((resolveSleep) => {
+    setTimeout(resolveSleep, ms)
+  })
+}
+
+async function createDealProperties(properties) {
+  return hubspotSend('/crm/v3/objects/deals', {
+    method: 'POST',
+    body: JSON.stringify({ properties }),
+  })
+}
+
+async function updateDealProperties(dealId, properties) {
+  return hubspotSend(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties }),
+  })
+}
+
+async function associateHubSpotObjects(fromType, fromId, toType, toId) {
+  return hubspotSend(
+    `/crm/v4/objects/${encodeURIComponent(fromType)}/${encodeURIComponent(
+      fromId,
+    )}/associations/default/${encodeURIComponent(toType)}/${encodeURIComponent(toId)}`,
+    { method: 'PUT' },
+  )
+}
+
+async function getAssociatedObjectIds(fromType, fromId, toType) {
+  const data = await hubspotGet(
+    `/crm/v4/objects/${encodeURIComponent(fromType)}/${encodeURIComponent(
+      fromId,
+    )}/associations/${encodeURIComponent(toType)}?limit=100`,
+  )
+
+  return (data.results || [])
+    .map((item) => item.toObjectId || item.to?.id || item.id)
+    .filter(Boolean)
+}
+
+async function fetchHubSpotObject(objectType, objectId, properties = []) {
+  const params = properties.length ? `?properties=${properties.map(encodeURIComponent).join(',')}` : ''
+
+  return hubspotGet(
+    `/crm/v3/objects/${encodeURIComponent(objectType)}/${encodeURIComponent(objectId)}${params}`,
+  )
+}
+
+async function upsertBookingContactProperties(customer) {
+  const properties = buildBookingContactProperties(customer)
+
+  if (Object.keys(properties).length === 0) {
+    return null
+  }
+
+  const contact = await findHubSpotContactByEmail(customer.email)
+
+  if (contact?.id) {
+    return updateContactProperties(contact.id, properties)
+  }
+
+  return createContactProperties(properties)
+}
+
+function buildBookingContactProperties(customer) {
+  const properties = {
+    firstname: customer.firstName || '',
+    lastname: customer.lastName || '',
+    email: customer.email || '',
+    phone: formatUsPhoneForHubSpot(customer.phone),
+    desired_treatment: normalizeDesiredTreatment(customer.desiredTreatment),
+  }
+
+  return Object.fromEntries(
+    Object.entries(properties).filter(([, value]) => Boolean(value)),
+  )
+}
+
+export function formatUsPhoneForHubSpot(phone = '') {
+  const rawPhone = String(phone || '').trim()
+  const digits = rawPhone.replace(/\D/g, '')
+  const nationalNumber =
+    digits.length === 11 && digits.startsWith('1')
+      ? digits.slice(1)
+      : digits.length === 10
+        ? digits
+        : ''
+
+  if (!nationalNumber) {
+    return rawPhone
+  }
+
+  // HubSpot validates booking/contact phone properties as E.164. A display
+  // value can be rejected by the scheduler even when it has the same digits.
+  return `+1${nationalNumber}`
+}
+
+async function updateContactProperties(contactId, properties) {
+  const response = await fetch(`${HUBSPOT_API_BASE_URL}/crm/v3/objects/contacts/${contactId}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${requireHubSpotToken()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      properties,
+    }),
+  })
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.message || `HubSpot contact update failed with ${response.status}.`)
+  }
+
+  return data
+}
+
+async function createContactProperties(properties) {
+  const response = await fetch(`${HUBSPOT_API_BASE_URL}/crm/v3/objects/contacts`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${requireHubSpotToken()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ properties }),
+  })
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.message || `HubSpot contact create failed with ${response.status}.`)
+  }
+
+  return data
+}
+
+function normalizeDesiredTreatment(value) {
+  const normalized = String(value || '').toLowerCase()
+  const searchable = normalizeTreatmentSearchText(value)
+  const compact = searchable.replace(/\s+/g, '')
+
+  if (/\b(zep|zepbound)\b/.test(searchable)) {
+    return 'Zepbound'
+  }
+
+  if (
+    /\b(weight loss|lose weight|losing weight|slim down|slimming|fat loss|bajar de peso|perder peso|glp 1|semaglutide|tirzepatide|wegovy|shot|shots|injection|injections|injectable|medication|meds)\b/.test(
+      searchable,
+    ) ||
+    /(weightloss|loseweight|losingweight|fatloss|slimdown|glp1)/.test(compact)
+  ) {
+    return 'Compounded Semaglutide'
+  }
+
+  if (/\b(nutri|nutrition|nutritionist|nutritional|diet|dietitian|meal plan|food plan|consult|consultation|consulta|asesoria nutricional|nutricion)\b/.test(searchable)) {
+    return 'Nutrition Consultation'
+  }
+
+  if (/\b(supp|supps|supplement|supplements|vitamin|vitamins|protein|collagen|greens|probiotic|suplemento|suplementos)\b/.test(searchable)) {
+    return 'Supplements'
+  }
+
+  if (/\b(nutri|consult|consultation)\b/i.test(normalized)) {
+    return 'Nutrition Consultation'
+  }
+
+  if (normalized.includes('zepbound')) {
+    return 'Zepbound'
+  }
+
+  if (
+    normalized.includes('weight loss') ||
+    normalized.includes('injection') ||
+    normalized.includes('glp') ||
+    normalized.includes('semaglutide') ||
+    normalized.includes('tirzepatide')
+  ) {
+    return 'Compounded Semaglutide'
+  }
+
+  if (normalized.includes('supplement')) {
+    return 'Supplements'
+  }
+
+  if (normalized.includes('nutrition')) {
+    return 'Nutrition Consultation'
+  }
+
+  return ''
+}
+
+function normalizeTreatmentSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function getSupportedFormFieldNames(meetingInfo) {
+  const names = new Set()
+
+  collectFormFieldNames(meetingInfo, names)
+
+  return [...names]
+}
+
+function collectFormFieldNames(value, names) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectFormFieldNames(item, names))
+    return
+  }
+
+  if (!value || typeof value !== 'object') {
+    return
+  }
+
+  if (typeof value.name === 'string') {
+    names.add(value.name)
+  }
+
+  Object.values(value).forEach((item) => collectFormFieldNames(item, names))
+}
+
+export async function findHubSpotContactByEmail(email) {
+  if (!email) {
+    return null
+  }
+
+  const token = requireHubSpotToken()
+  const response = await fetch(`${HUBSPOT_API_BASE_URL}/crm/v3/objects/contacts/search`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      filterGroups: [
+        {
+          filters: [
+            {
+              propertyName: 'email',
+              operator: 'EQ',
+              value: email,
+            },
+          ],
+        },
+      ],
+      properties: ['firstname', 'lastname', 'email', 'phone', 'state'],
+      limit: 1,
+    }),
+  })
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.message || `HubSpot contact lookup failed with ${response.status}.`)
+  }
+
+  return data.results?.[0] || null
+}
+
+async function fetchMeetingInfo({ slug, timezone }) {
+  return hubspotGet(`/scheduler/v3/meetings/meeting-links/book/${encodeURIComponent(slug)}?timezone=${encodeURIComponent(timezone)}`)
+}
+
+async function fetchAvailability({ slug, timezone, monthOffset = 0 }) {
+  return hubspotGet(
+    `/scheduler/v3/meetings/meeting-links/book/availability-page/${encodeURIComponent(slug)}?timezone=${encodeURIComponent(timezone)}&monthOffset=${encodeURIComponent(monthOffset)}`,
+  )
+}
+
+async function hubspotGet(path) {
+  const token = requireHubSpotToken()
+  const response = await fetch(`${HUBSPOT_API_BASE_URL}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  })
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.message || `HubSpot request failed with ${response.status}.`)
+  }
+
+  return data
+}
+
+async function hubspotSend(path, options = {}) {
+  const token = requireHubSpotToken()
+  const response = await fetch(`${HUBSPOT_API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  })
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.message || `HubSpot request failed with ${response.status}.`)
+  }
+
+  return data
+}
+
+export function getConfiguredPrioritySellers() {
+  const disabledSlugs = new Set(
+    (process.env.HUBSPOT_DISABLED_SELLER_SLUGS || DEFAULT_DISABLED_SELLER_SLUGS.join(','))
+      .split(',')
+      .map((slug) => slug.trim())
+      .filter(Boolean),
+  )
+  const configuredSlugs = process.env.HUBSPOT_PRIORITY_SELLER_SLUGS?.split(',')
+    .map((slug) => slug.trim())
+    .filter(Boolean)
+
+  if (!configuredSlugs?.length) {
+    return PRIORITY_SELLERS.filter((seller) => !disabledSlugs.has(seller.slug))
+  }
+
+  return configuredSlugs
+    .map((slug) => PRIORITY_SELLERS.find((seller) => seller.slug === slug))
+    .filter(Boolean)
+    .filter((seller) => !disabledSlugs.has(seller.slug))
+}
+
+export function getConfiguredCustomerServiceTeam() {
+  const defaultTeam = CUSTOMER_SERVICE_TEAM.map((member) =>
+    member.slug === 'aline-strelow' && (process.env.HUBSPOT_ALINE_MEETING_SLUG || process.env.HUBSPOT_ALICE_MEETING_SLUG)
+      ? { ...member, slug: process.env.HUBSPOT_ALINE_MEETING_SLUG || process.env.HUBSPOT_ALICE_MEETING_SLUG }
+      : member,
+  ).filter((member) => member.slug)
+  const configuredSlugs = process.env.HUBSPOT_CS_TEAM_SLUGS?.split(',')
+    .map((slug) => slug.trim())
+    .filter(Boolean)
+
+  if (!configuredSlugs?.length) {
+    return defaultTeam
+  }
+
+  return configuredSlugs
+    .map((slug) => defaultTeam.find((member) => member.slug === slug))
+    .filter(Boolean)
+}
+
+export function getConfiguredNewClientBookingTeam() {
+  return [
+    ...getConfiguredPrioritySellers().map((member) => ({ ...member, bookingTeam: 'sales' })),
+    ...getConfiguredCustomerServiceTeam().map((member) => ({ ...member, bookingTeam: 'customer_service' })),
+  ]
+}
+
+export function resolveBookingTeamForOption(option = {}, fallbackTeam = 'sales') {
+  const slug = String(option.sellerSlug || '').trim()
+
+  if (slug && getConfiguredCustomerServiceTeam().some((member) => member.slug === slug)) {
+    return 'customer_service'
+  }
+
+  if (slug && getConfiguredPrioritySellers().some((member) => member.slug === slug)) {
+    return 'sales'
+  }
+
+  return option.bookingTeam === 'customer_service' || option.bookingTeam === 'sales'
+    ? option.bookingTeam
+    : fallbackTeam
+}
+
+export function getConfiguredFrontDeskTeam() {
+  const configuredSlugs = process.env.RESPOND_FRONT_DESK_TEAM_SLUGS?.split(',')
+    .map((slug) => slug.trim())
+    .filter(Boolean)
+
+  if (!configuredSlugs?.length) {
+    return FRONT_DESK_TEAM
+  }
+
+  return configuredSlugs
+    .map((slug) => FRONT_DESK_TEAM.find((member) => member.slug === slug))
+    .filter(Boolean)
+}
+
+function filterSellersByPreference(sellers, preferredSpecialist) {
+  const normalizedPreference = normalizeText(preferredSpecialist)
+
+  if (!normalizedPreference) {
+    return sellers
+  }
+
+  const matchingSellers = sellers.filter((seller) => {
+    const sellerText = normalizeText(`${seller.name} ${seller.fieldValue} ${seller.slug}`)
+    return sellerText.includes(normalizedPreference) || normalizedPreference.includes(normalizeText(seller.name))
+  })
+
+  return matchingSellers.length ? matchingSellers : sellers
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function requireHubSpotToken() {
+  const token = process.env.HUBSPOT_PRIVATE_APP_TOKEN
+
+  if (!token) {
+    throw new Error('HUBSPOT_PRIVATE_APP_TOKEN is not configured.')
+  }
+
+  return token
+}
+
+function formatSpecialistSlot({ specialistName, timestamp, timezone, language = '' }) {
+  const locale = resolveLocale(language)
+  const specialistLabel = locale === 'es' ? 'Especialista' : locale === 'pt-br' ? 'Especialista' : 'Specialist'
+  const formatter = new Intl.DateTimeFormat(locale, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: timezone,
+    timeZoneName: 'short',
+  })
+
+  return `${specialistLabel} ${specialistName} - ${formatter.format(new Date(timestamp))}`
+}
+
+function resolveLocale(language) {
+  const normalized = String(language || '').toLowerCase()
+
+  if (normalized.includes('spanish') || normalized.startsWith('es')) {
+    return 'es'
+  }
+
+  if (normalized.startsWith('portuguese') || normalized.startsWith('pt')) {
+    return 'pt-br'
+  }
+
+  return 'en-us'
+}
+
+export function parsePreferredWeekdays(value) {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+
+  const weekdaysEnglish = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+  const weekdaysSpanish = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado']
+  const weekdaysPortuguese = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado']
+
+  const matches = []
+  for (let i = 0; i < 7; i++) {
+    if (
+      normalized.includes(weekdaysEnglish[i]) ||
+      normalized.includes(weekdaysSpanish[i]) ||
+      normalized.includes(weekdaysPortuguese[i])
+    ) {
+      matches.push(i)
+    }
+  }
+
+  return matches
+}

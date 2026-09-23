@@ -1,0 +1,263 @@
+export function isCustomerServiceBookingStatus(profile = {}) {
+  const exactStatus = normalizeStatus(
+    profile?.fields?.contactStatus || profile?.exactContactStatus,
+  )
+
+  return exactStatus === 'client' || exactStatus === 'evaluation scheduled'
+}
+
+export function shouldUseNewClientBookingFlow(profile = {}) {
+  return !isCustomerServiceBookingStatus(profile)
+}
+
+export function removeAvailabilitySignalsFromNameReply(signals = {}, pendingField = '') {
+  if (pendingField !== 'name') return signals
+
+  const nextSignals = { ...signals }
+  delete nextSignals.preferredTime
+  delete nextSignals.earliestHour
+  delete nextSignals.latestHour
+  delete nextSignals.dayPart
+  delete nextSignals.direction
+  delete nextSignals.allowBeforeDefaultStart
+  return nextSignals
+}
+
+export function isUsCountryCodePhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '')
+
+  return digits.length === 10 || (digits.length === 11 && digits.startsWith('1'))
+}
+
+export function normalizeUsPhoneNumber(phone) {
+  const digits = String(phone || '').replace(/\D/g, '')
+
+  if (digits.length === 10) {
+    return `1${digits}`
+  }
+
+  if (digits.length === 11 && digits.startsWith('1')) {
+    return digits
+  }
+
+  return ''
+}
+
+export function extractUsPhoneNumber(content = '') {
+  const candidates = String(content).match(/(?<![\d+])\+?\d[\d\s().-]{7,}\d(?!\d)/g) || []
+
+  return candidates
+    .map((candidate) => candidate.trim())
+    .find((candidate) => isUsCountryCodePhone(candidate)) || ''
+}
+
+export function createDummyEmailFromProvidedPhone(phone) {
+  const digits = normalizePhoneDigitsForEmail(phone)
+
+  return digits ? `${digits}@dummy.com` : ''
+}
+
+export function normalizePhoneDigitsForEmail(phone) {
+  return normalizeUsPhoneNumber(phone)
+}
+
+export function extractCustomerFullName(content = '') {
+  const withoutPhoneOrEmail = stripPhoneAndEmail(content)
+  const explicitName = extractExplicitName(withoutPhoneOrEmail)
+  if (explicitName) {
+    return cleanExplicitNameCandidate(explicitName)
+  }
+
+  return cleanFullNameCandidate(withoutPhoneOrEmail)
+}
+
+export function splitCustomerFullName(content = '') {
+  const fullName = extractCustomerFullName(content)
+
+  if (!fullName) {
+    return {}
+  }
+
+  const parts = fullName.split(/\s+/).filter(Boolean)
+
+  return {
+    firstName: parts[0] || '',
+    lastName: parts.slice(1).join(' '),
+    nameConfirmed: true,
+  }
+}
+
+export function mergeCustomerNameReply(details = {}, content = '') {
+  const fullName = splitCustomerFullName(content)
+  if (fullName.nameConfirmed) {
+    return { ...details, ...fullName, partialFirstName: '' }
+  }
+
+  const singleName = extractSingleCustomerName(content)
+  if (!singleName) return details
+
+  const partialFirstName = String(details.partialFirstName || '').trim()
+  if (partialFirstName) {
+    return {
+      ...details,
+      firstName: partialFirstName,
+      lastName: singleName,
+      nameConfirmed: true,
+      partialFirstName: '',
+    }
+  }
+
+  return { ...details, partialFirstName: singleName }
+}
+
+export function hasConfirmedFullName(details = {}) {
+  return Boolean(
+    details.nameConfirmed &&
+      details.firstName &&
+      details.lastName &&
+      isFullNameCandidate([details.firstName, details.lastName].join(' ')),
+  )
+}
+
+function extractExplicitName(content) {
+  const patterns = [
+    /\b(?:my\s+(?:full\s+)?name\s+is|name\s+is|this\s+is|it'?s|its)\s+([^.!?,;\n]+)/i,
+    /\b(?:book(?:\s+it)?\s+(?:for|under)|put\s+(?:it\s+)?(?:for|under)|use\s+(?:the\s+)?name)\s+([^.!?,;\n]+)/i,
+    /\b(?:mi\s+nombre\s+es|soy|me\s+llamo|a\s+nombre\s+de)\s+([^.!?,;\n]+)/i,
+    /\b(?:meu\s+nome\s+e|meu\s+nome\s+é|sou|em\s+nome\s+de)\s+([^.!?,;\n]+)/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = String(content || '').match(pattern)
+
+    if (match?.[1]) {
+      return match[1]
+    }
+  }
+
+  return ''
+}
+
+function cleanFullNameCandidate(value) {
+  const cleaned = String(value || '')
+    .replace(/^\s*(?:yes|yeah|yep|sure|si|sí|claro|ok|okay)[\s,;:.-]+/i, '')
+    .replace(/\b(?:please|pls|thanks|thank you|gracias|por favor|obrigado|obrigada)\b/gi, ' ')
+    .replace(/\b(?:book|appointment|cita|consulta|call|llamada|chamada|slot|time|hora|horario)\b/gi, ' ')
+    .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ' -]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (isLikelyNonNamePhrase(cleaned)) {
+    return ''
+  }
+
+  if (!isFullNameCandidate(cleaned)) {
+    return ''
+  }
+
+  return cleaned
+}
+
+function cleanExplicitNameCandidate(value) {
+  const cleaned = String(value || '')
+    .replace(/\b(?:please|pls|thanks|thank you|gracias|por favor|obrigado|obrigada)\b/gi, ' ')
+    .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ' -]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const parts = cleaned.split(/\s+/).filter(Boolean)
+
+  return parts.length >= 2 && parts.length <= 5 && !isLikelyNonNamePhrase(cleaned)
+    ? cleaned
+    : ''
+}
+
+function extractSingleCustomerName(content) {
+  const withoutPhoneOrEmail = stripPhoneAndEmail(content)
+  const explicitName = extractExplicitNameFragment(withoutPhoneOrEmail)
+  const cleaned = String(explicitName || withoutPhoneOrEmail)
+    .replace(/^\s*(?:yes|yeah|yep|sure|si|sí|claro|ok|okay)[\s,;:.-]+/i, '')
+    .replace(/\b(?:please|pls|thanks|thank you|gracias|por favor|obrigado|obrigada)\b/gi, ' ')
+    .replace(/[^\p{L}' -]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const parts = cleaned.split(/\s+/).filter(Boolean)
+  const normalized = normalizeStatus(cleaned)
+
+  if (parts.length !== 1 || parts[0].length < 2 || isLikelyNonNamePhrase(cleaned) || isAcknowledgmentPhrase(normalized)) {
+    return ''
+  }
+
+  if (/\b(?:yes|no|hello|hola|price|cost|today|tomorrow|state|appointment|call|perfecto|correcto|vale|bueno)\b/.test(normalized)) {
+    return ''
+  }
+
+  return parts[0]
+}
+
+function extractExplicitNameFragment(content) {
+  const patterns = [
+    /\b(?:my\s+(?:full\s+)?name\s+is|name\s+is|this\s+is|it'?s|its)\s+([^.!?,;\n]+)/i,
+    /\b(?:mi\s+nombre\s+es|soy|me\s+llamo|a\s+nombre\s+de)\s+([^.!?,;\n]+)/i,
+    /\b(?:meu\s+nome\s+e|meu\s+nome\s+é|sou|em\s+nome\s+de)\s+([^.!?,;\n]+)/i,
+  ]
+
+  return patterns.map((pattern) => String(content || '').match(pattern)?.[1] || '').find(Boolean) || ''
+}
+
+function isFullNameCandidate(value) {
+  const parts = String(value || '').split(/\s+/).filter(Boolean)
+  const normalized = normalizeStatus(value)
+
+  if (isAcknowledgmentPhrase(normalized)) {
+    return false
+  }
+
+  if (parts.length < 2 || parts.length > 5) {
+    return false
+  }
+
+  if (!/^[\p{L}][\p{L}' -]+$/u.test(value)) {
+    return false
+  }
+
+  if (/\b(?:already sent|sent it|se lo mande|se lo envi[eé]|ya lo mande|ya lo envi[eé]|ja enviei|já enviei)\b/.test(normalized)) {
+    return false
+  }
+
+  return !/\b(yes|yeah|yep|ok|okay|sure|no|not|only|available|availability|later|tomorrow|today|morning|afternoon|evening|monday|tuesday|wednesday|thursday|friday|saturday|sunday|si|claro|dale|hola|hello|hi|price|cost|weight|loss|injection|state|florida|california|client|medication|medicine|treatment|appointment|call|y|para|hoy|manana|ahora|tarde|quiero|precio|precios|e|para|hoje|amanha|agora)\b/.test(
+    normalized,
+  )
+}
+
+function isLikelyNonNamePhrase(value) {
+  const normalized = normalizeStatus(value)
+
+  return [
+    /^(?:what|how|when|where|why|who|which|can|could|do|does|is|are)\b/,
+    /^(?:que|cual|como|cuando|donde|por que|cuanto|cuantos|puede|puedes)\b/,
+    /^(?:o que|qual|como|quando|onde|por que|quanto|pode)\b/,
+    /\b(?:price|prices|cost|costs|pricing|payment|precio|precios|cuesta|cuestan|costo|costos|pago|preco|precos|custa|custam|pagamento)\b/,
+    /\b(?:appointment|call|treatment|medication|medicine|cita|llamada|tratamiento|medicamento|consulta|chamada|tratamento)\b/,
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function isAcknowledgmentPhrase(normalized) {
+  return /^(?:esta\s*bien|de\s*acuerdo|todo\s*bien|muy\s*bien|perfecto|correcto|vale|bueno)$/.test(
+    String(normalized || '').replace(/\s+/g, ' ').trim(),
+  )
+}
+
+function stripPhoneAndEmail(content) {
+  return String(content || '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, ' ')
+    .replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4,}/g, ' ')
+}
+
+function normalizeStatus(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
