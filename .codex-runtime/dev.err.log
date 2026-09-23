@@ -1,0 +1,1 @@
+[api] Knowledge search skipped: Could not find the function public.match_agent_knowledge(match_agent_id, match_count, match_source_types, query_embedding) in the schema cache

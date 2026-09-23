@@ -1,0 +1,13 @@
+
+> dharma-agent@0.0.0 dev
+> node scripts/dev.js
+
+[vite] [2m4:36:27 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m Re-optimizing dependencies because vite config has changed
+[vite] 
+  [32m[1mVITE[22m v8.1.0[39m  [2mready in [0m[1m273[22m[2m[0m ms[22m
+
+[vite]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[api] API server listening on http://localhost:8787
+[vite] [2m4:44:27 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/components/chat/TypingIndicator.jsx[22m
+[vite] [2m4:44:27 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles/app.css[22m
